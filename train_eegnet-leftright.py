@@ -1,18 +1,20 @@
 
-"""EEGnet: (~50% test, major overfitting though)"""
+"""EEGNet restricted to left_fist vs right_fist only (binary classification).
+
+Same model, same RandAugment/SMOTE/training loop, and same cleaning
+pipeline as train_eegnet.py -- the only change is filtering the built
+5-class dataset down to just these two classes (remapped to labels 0/1)
+right after loading, via the shared filter_to_classes() utility.
+"""
 
 import argparse
-import time
-from pathlib import Path
 
-import mne
 import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix
 
 from train_mlp import (
-    CLASSES,
     DATA_ROOT,
     MONTAGE,
     RUN_LABELS,
@@ -22,18 +24,21 @@ from train_mlp import (
     N_SAMPLES,
     remove_ica_artifacts,
     subject_dirs,
+    filter_to_classes,
     subject_dependent_split,
     subject_independent_split,
     smote_augment,
-    run_epoch,
 )
+import mne
+import time
+from pathlib import Path
 
 mne.set_log_level("ERROR")
 
 CACHE_PATH = Path(__file__).parent / ".cache" / "eegnet_epochs.npz"
 
-# Wider motor-strip montage (not channel pairs) -- EEGNet's spatial
-# filter needs multiple simultaneous channels to do anything meaningful.
+LR_CLASSES = ["left_fist", "right_fist"]
+
 EEGNET_CHANNELS = [
     "Fc3", "Fc1", "Fcz", "Fc2", "Fc4",
     "C3", "C1", "Cz", "C2", "C4",
@@ -79,7 +84,6 @@ def load_subject_epochs_eegnet(sid: int, subj_dir: Path):
     X = np.concatenate(Xs, axis=0)
     y = np.concatenate(ys, axis=0)
 
-    # Per-subject z-score normalization, same rationale as train_mlp.py.
     mean = X.mean(axis=(0, 2), keepdims=True)
     std = X.std(axis=(0, 2), keepdims=True) + 1e-8
     X = (X - mean) / std
@@ -119,23 +123,7 @@ def build_dataset_eegnet(max_subjects=None, use_cache=True):
 
 class RandAugmentEEG:
     """RandAugment (Cubuk et al., 2019) adapted to EEG time series.
-
-    There's no single canonical "RandAugment for EEG/time-series" paper
-    the way there is for images -- but the actual RandAugment RECIPE
-    (randomly pick N transforms from a fixed pool, apply each at one
-    shared magnitude M, no policy search) generalizes directly. The
-    pool here is EEG-appropriate instead of image-appropriate (there's
-    no equivalent of "rotate" or "color jitter" for a voltage trace):
-    jitter, scale, time-shift, time-mask, channel dropout, and a smooth
-    magnitude-warp envelope -- all standard entries in the general
-    time-series-augmentation literature (see Wen et al. 2021's survey).
-
-    Applied per-sample inside the training Dataset's __getitem__, so
-    each sample gets a FRESH random augmentation every epoch -- unlike
-    SMOTE, which generates one fixed set of synthetic samples once.
-    Only ever used on the training split; val/test stay real and
-    deterministic.
-    """
+    Same as train_eegnet.py -- see that file for the full rationale."""
 
     def __init__(self, n_ops=2, magnitude=0.5, seed=None):
         self.n_ops = n_ops
@@ -191,10 +179,6 @@ class RandAugmentEEG:
 
 
 class AugmentedEEGDataset(torch.utils.data.Dataset):
-    """Like TensorDataset, but applies `augment` fresh on every access
-    instead of once up front -- necessary for augmentation to actually
-    increase the diversity the network sees across epochs."""
-
     def __init__(self, X, y, augment=None):
         self.X = X
         self.y = y
@@ -213,11 +197,7 @@ class AugmentedEEGDataset(torch.utils.data.Dataset):
 
 class EEGNet(nn.Module):
     """Direct port of EEGModels.py's `EEGNet` (Keras/TF) to PyTorch.
-
-    Input is (batch, chans, samples); internally reshaped to
-    (batch, 1, chans, samples) to match the reference's NHWC-style
-    (Chans, Samples, 1) convention, ported to PyTorch's NCHW.
-    """
+    Same architecture as train_eegnet.py -- see that file for details."""
 
     def __init__(self, n_classes, chans, samples,
                  dropout_rate=0.5, kernel_length=64,
@@ -234,7 +214,6 @@ class EEGNet(nn.Module):
 
         self.norm_rate = norm_rate
 
-        # Block 1: temporal conv -> depthwise (spatial) conv
         self.conv1 = nn.Conv2d(1, F1, kernel_size=(1, kernel_length),
                                 padding="same", bias=False)
         self.bn1 = nn.BatchNorm2d(F1)
@@ -245,7 +224,6 @@ class EEGNet(nn.Module):
         self.pool1 = nn.AvgPool2d((1, 4))
         self.drop1 = DropoutCls(dropout_rate)
 
-        # Block 2: separable conv (depthwise + pointwise)
         self.sep_depthwise = nn.Conv2d(F1 * D, F1 * D, kernel_size=(1, 16),
                                         padding="same", groups=F1 * D, bias=False)
         self.sep_pointwise = nn.Conv2d(F1 * D, F2, kernel_size=1, bias=False)
@@ -258,7 +236,7 @@ class EEGNet(nn.Module):
         self.classifier = nn.Linear(F2 * flat_samples, n_classes)
 
     def forward(self, x):
-        x = x.unsqueeze(1)  # (batch, 1, chans, samples)
+        x = x.unsqueeze(1)
 
         x = self.conv1(x)
         x = self.bn1(x)
@@ -280,11 +258,6 @@ class EEGNet(nn.Module):
 
     @torch.no_grad()
     def apply_max_norm(self):
-        """Keras' max_norm weight constraints, applied as a hard clip
-        after each optimizer step (Keras applies these as constraints
-        baked into the layer; PyTorch has no equivalent, so this must
-        be called manually post-step). Clips per-output-filter L2 norm:
-        depthwise conv to 1.0 (Table 2), final Dense to norm_rate=0.25."""
         for weight, max_val in (
             (self.depthwise.weight, 1.0),
             (self.classifier.weight, self.norm_rate),
@@ -317,7 +290,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--patience", type=int, default=2000)
+    ap.add_argument("--patience", type=int, default=15)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--test-frac", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=42)
@@ -326,9 +299,7 @@ def main():
     ap.add_argument("--no-smote", action="store_true")
     ap.add_argument("--smote-k", type=int, default=5)
     ap.add_argument("--no-augment", action="store_true",
-                     help="Disable RandAugment-style training-time data augmentation "
-                          "(on by default -- EEGNet's small size still overfits on the "
-                          "limited number of genuinely distinct trials)")
+                     help="Disable RandAugment-style training-time data augmentation")
     ap.add_argument("--randaugment-n", type=int, default=2,
                      help="Number of augmentation ops applied per sample (RandAugment default: 2)")
     ap.add_argument("--randaugment-m", type=float, default=0.5,
@@ -340,9 +311,10 @@ def main():
 
     X, y, groups = build_dataset_eegnet(max_subjects=args.max_subjects,
                                          use_cache=not args.no_cache)
-    print(f"Dataset: X={X.shape}, classes={CLASSES}, "
+    X, y, groups = filter_to_classes(X, y, groups, LR_CLASSES)
+    print(f"Dataset (left_fist vs right_fist only): X={X.shape}, classes={LR_CLASSES}, "
           f"subjects={len(set(groups.tolist()))}")
-    print("Class counts:", {c: int((y == i).sum()) for i, c in enumerate(CLASSES)})
+    print("Class counts:", {c: int((y == i).sum()) for i, c in enumerate(LR_CLASSES)})
 
     if args.split_mode == "subject-dependent":
         train_mask, val_mask, test_mask = subject_dependent_split(
@@ -359,7 +331,7 @@ def main():
 
     if not args.no_smote:
         X_train, y_train = smote_augment(X_train, y_train, k=args.smote_k, seed=args.seed)
-        counts = {c: int((y_train == i).sum()) for i, c in enumerate(CLASSES)}
+        counts = {c: int((y_train == i).sum()) for i, c in enumerate(LR_CLASSES)}
         print(f"After SMOTE: train={len(y_train)} epochs, class counts={counts}")
 
     device = torch.device("cuda" if torch.cuda.is_available()
@@ -388,7 +360,7 @@ def main():
     test_loader = make_loader(X_test, y_test, shuffle=False)
 
     n_channels, n_times = X_train.shape[1], X_train.shape[2]
-    model = EEGNet(len(CLASSES), n_channels, n_times,
+    model = EEGNet(len(LR_CLASSES), n_channels, n_times,
                    dropout_rate=args.dropout, kernel_length=args.kernel_length,
                    F1=args.f1, D=args.d, F2=args.f2, norm_rate=args.norm_rate,
                    dropout_type=args.dropout_type).to(device)
@@ -454,9 +426,9 @@ def main():
     all_true = np.concatenate(all_true)
 
     print("\nClassification report (test set):")
-    print(classification_report(all_true, all_preds, target_names=CLASSES, digits=3))
+    print(classification_report(all_true, all_preds, target_names=LR_CLASSES, digits=3))
     print("Confusion matrix (rows=true, cols=pred):")
-    print(CLASSES)
+    print(LR_CLASSES)
     print(confusion_matrix(all_true, all_preds))
 
 

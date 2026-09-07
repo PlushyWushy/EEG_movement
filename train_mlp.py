@@ -141,6 +141,97 @@ def load_subject_epochs(sid: int, subj_dir: Path):
     return X, y
 
 
+def load_subject_epochs_raw(sid: int, subj_dir: Path, channels, expand_pairs=None):
+    """Same event extraction / epoching as load_subject_epochs, but skips
+    the entire cleaning pipeline: no montage, no notch filter, no ICA,
+    no bandpass filter. Signal goes straight from the recording to
+    picking channels and cutting epochs -- an ablation counterpart to
+    measure how much the cleaning pipeline actually buys a given model.
+
+    Per-subject z-score normalization is still applied, but that's a
+    numerical-conditioning concern (raw EEG is ~1e-5 V, too small for
+    stable gradients otherwise), not signal cleaning, so it stays in
+    both the cleaned and raw versions -- keeping it isolates the
+    ablation to just the filtering/artifact-removal question."""
+    Xs, ys = [], []
+    for run, label_map in RUN_LABELS.items():
+        edf_path = subj_dir / f"S{sid:03d}R{run:02d}.edf"
+        if not edf_path.exists():
+            continue
+        raw = mne.io.read_raw_edf(edf_path, preload=True, verbose="ERROR")
+        raw.rename_channels({ch: ch.rstrip(".") for ch in raw.ch_names})
+        raw.pick(channels)
+
+        events, event_id = mne.events_from_annotations(raw, verbose="ERROR")
+        wanted = {k: v for k, v in event_id.items() if k in label_map}
+        if not wanted:
+            continue
+        epochs = mne.Epochs(
+            raw, events, event_id=wanted,
+            tmin=EPOCH_TMIN, tmax=EPOCH_TMAX,
+            baseline=None, preload=True, verbose="ERROR",
+        )
+        codes = epochs.events[:, 2]
+        code_to_desc = {v: k for k, v in wanted.items()}
+        labels_full = np.array(
+            [CLASS_TO_IDX[label_map[code_to_desc[c]]] for c in codes],
+            dtype=np.int64,
+        )
+        data_full = epochs.get_data(copy=True)[:, :, :N_SAMPLES].astype(np.float32)
+
+        if expand_pairs:
+            for ch_a, ch_b in expand_pairs:
+                idx_a = epochs.ch_names.index(ch_a)
+                idx_b = epochs.ch_names.index(ch_b)
+                Xs.append(data_full[:, [idx_a, idx_b], :])
+                ys.append(labels_full)
+        else:
+            Xs.append(data_full)
+            ys.append(labels_full)
+
+    if not Xs:
+        return None, None
+    X = np.concatenate(Xs, axis=0)
+    y = np.concatenate(ys, axis=0)
+
+    mean = X.mean(axis=(0, 2), keepdims=True)
+    std = X.std(axis=(0, 2), keepdims=True) + 1e-8
+    X = (X - mean) / std
+    return X, y
+
+
+def build_dataset_raw(cache_path, channels, expand_pairs=None,
+                       max_subjects=None, use_cache=True):
+    if use_cache and cache_path.exists():
+        print(f"Loading cached epochs from {cache_path}")
+        d = np.load(cache_path)
+        return d["X"], d["y"], d["groups"]
+
+    subs = subject_dirs(DATA_ROOT, max_subjects)
+    print(f"Processing {len(subs)} subjects from {DATA_ROOT} (no cleaning pipeline)")
+    Xs, ys, groups = [], [], []
+    t0 = time.time()
+    for i, (sid, subj_dir) in enumerate(subs, 1):
+        X, y = load_subject_epochs_raw(sid, subj_dir, channels, expand_pairs)
+        if X is None:
+            print(f"  [{i}/{len(subs)}] S{sid:03d}: no usable runs, skipped")
+            continue
+        Xs.append(X)
+        ys.append(y)
+        groups.append(np.full(len(y), sid, dtype=np.int64))
+        print(f"  [{i}/{len(subs)}] S{sid:03d}: {len(y)} epochs "
+              f"({time.time()-t0:.0f}s elapsed)")
+
+    X = np.concatenate(Xs, axis=0)
+    y = np.concatenate(ys, axis=0)
+    groups = np.concatenate(groups, axis=0)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, X=X, y=y, groups=groups)
+    print(f"Cached processed epochs to {cache_path}")
+    return X, y, groups
+
+
 def build_dataset(max_subjects=None, use_cache=True):
     if use_cache and CACHE_PATH.exists():
         print(f"Loading cached epochs from {CACHE_PATH}")
@@ -266,6 +357,22 @@ def smote_augment(X, y, k=5, seed=42):
           f"generated {len(synth_y)} synthetic samples -> "
           f"target {majority_count} per class")
     return np.concatenate([X, synth_X], axis=0), np.concatenate([y, synth_y], axis=0)
+
+
+def filter_to_classes(X, y, groups, class_names):
+    """Restrict a built dataset to only the given classes (by name, from
+    CLASSES), remapping labels to a fresh contiguous 0..N-1 range in the
+    order given. Call this right after build_dataset()/build_dataset_raw(),
+    before splitting -- turns the full 5-class task into a smaller
+    subset (e.g. just left_fist vs right_fist) with no separate
+    preprocessing pass or cache needed."""
+    keep_indices = [CLASS_TO_IDX[c] for c in class_names]
+    mask = np.isin(y, keep_indices)
+    X_f = X[mask]
+    groups_f = groups[mask]
+    remap = {old: new for new, old in enumerate(keep_indices)}
+    y_f = np.array([remap[v] for v in y[mask]], dtype=np.int64)
+    return X_f, y_f, groups_f
 
 
 class MLP(nn.Module):
