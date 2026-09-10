@@ -16,8 +16,8 @@ from sklearn.neighbors import NearestNeighbors
 
 mne.set_log_level("ERROR")
 
-DATA_ROOT = Path(__file__).parent / "physionet.org" / "files" / "eegmmidb" / "1.0.0"
-CACHE_PATH = Path(__file__).parent / ".cache" / "mi_epochs.npz"
+DATA_ROOT = Path(__file__).parent.parent / "physionet.org" / "files" / "eegmmidb" / "1.0.0"
+CACHE_PATH = Path(__file__).parent.parent / ".cache" / "mi_epochs.npz"
 
 EXCLUDED_SUBJECTS = {38, 88, 89, 92, 100, 104}
 

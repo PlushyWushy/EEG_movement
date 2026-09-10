@@ -13,6 +13,7 @@ conditioning, not signal cleaning -- see load_subject_epochs_raw).
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +21,8 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix
 
-from train_mlp import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from mlp.train_mlp import (
     build_dataset_raw,
     filter_to_classes,
     subject_dependent_split,
@@ -28,7 +30,7 @@ from train_mlp import (
     smote_augment,
 )
 
-CACHE_PATH = Path(__file__).parent / ".cache" / "eegnet_epochs_raw.npz"
+CACHE_PATH = Path(__file__).parent.parent / ".cache" / "eegnet_epochs_raw.npz"
 
 LR_CLASSES = ["left_fist", "right_fist"]
 

@@ -1,8 +1,15 @@
 
 """
-CNN-GRU no preprocessing (test accuracy 89.78% ???)
+CNN-GRU restricted to left_fist vs right_fist only (binary classification).
+
+Same model, same training loop, same channel-pair data structuring,
+SMOTE, and cleaning pipeline as train_cnn-gru.py -- the only change is
+filtering the built 5-class dataset down to just these two classes
+(remapped to labels 0/1) right after loading, via the shared
+filter_to_classes() utility.
 """
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -10,19 +17,18 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix
 
-from train_mlp import (
-    CLASSES,
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from mlp.train_mlp import (
     N_SAMPLES,
-    CHANNEL_PAIRS,
-    PAIR_CHANNELS,
-    build_dataset_raw,
+    build_dataset,
+    filter_to_classes,
     run_epoch,
     smote_augment,
     subject_dependent_split,
     subject_independent_split,
 )
 
-CACHE_PATH = Path(__file__).parent / ".cache" / "mi_epochs_raw.npz"
+LR_CLASSES = ["left_fist", "right_fist"]
 
 
 class CNN1D(nn.Module):
@@ -88,7 +94,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--patience", type=int, default=200,
+    ap.add_argument("--patience", type=int, default=15,
                      help="Early-stopping patience (epochs without val-loss improvement)")
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--test-frac", type=float, default=0.15)
@@ -108,12 +114,12 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    X, y, groups = build_dataset_raw(CACHE_PATH, PAIR_CHANNELS, expand_pairs=CHANNEL_PAIRS,
-                                      max_subjects=args.max_subjects,
-                                      use_cache=not args.no_cache)
-    print(f"Dataset: X={X.shape}, classes={CLASSES}, "
+    X, y, groups = build_dataset(max_subjects=args.max_subjects,
+                                  use_cache=not args.no_cache)
+    X, y, groups = filter_to_classes(X, y, groups, LR_CLASSES)
+    print(f"Dataset (left_fist vs right_fist only): X={X.shape}, classes={LR_CLASSES}, "
           f"subjects={len(set(groups.tolist()))}")
-    print("Class counts:", {c: int((y == i).sum()) for i, c in enumerate(CLASSES)})
+    print("Class counts:", {c: int((y == i).sum()) for i, c in enumerate(LR_CLASSES)})
 
     if args.split_mode == "subject-dependent":
         train_mask, val_mask, test_mask = subject_dependent_split(
@@ -130,7 +136,7 @@ def main():
 
     if not args.no_smote:
         X_train, y_train = smote_augment(X_train, y_train, k=args.smote_k, seed=args.seed)
-        counts = {c: int((y_train == i).sum()) for i, c in enumerate(CLASSES)}
+        counts = {c: int((y_train == i).sum()) for i, c in enumerate(LR_CLASSES)}
         print(f"After SMOTE: train={len(y_train)} epochs, class counts={counts}")
 
     device = torch.device("cuda" if torch.cuda.is_available()
@@ -150,7 +156,7 @@ def main():
 
     n_channels, n_times = X_train.shape[1], X_train.shape[2]
     assert n_times == N_SAMPLES
-    model = CNN1D(n_channels, n_times, len(CLASSES),
+    model = CNN1D(n_channels, n_times, len(LR_CLASSES),
                   n_filters1=args.n_filters1, n_filters2=args.n_filters2,
                   kernel_size1=args.kernel_size1, kernel_size2=args.kernel_size2,
                   gru_hidden=args.gru_hidden,
@@ -199,9 +205,9 @@ def main():
     all_true = np.concatenate(all_true)
 
     print("\nClassification report (test set):")
-    print(classification_report(all_true, all_preds, target_names=CLASSES, digits=3))
+    print(classification_report(all_true, all_preds, target_names=LR_CLASSES, digits=3))
     print("Confusion matrix (rows=true, cols=pred):")
-    print(CLASSES)
+    print(LR_CLASSES)
     print(confusion_matrix(all_true, all_preds))
 
 

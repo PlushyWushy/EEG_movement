@@ -2,6 +2,7 @@
 """EEGnet: (~50% test, major overfitting though)"""
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
@@ -11,7 +12,8 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix
 
-from train_mlp import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from mlp.train_mlp import (
     CLASSES,
     DATA_ROOT,
     MONTAGE,
@@ -30,7 +32,7 @@ from train_mlp import (
 
 mne.set_log_level("ERROR")
 
-CACHE_PATH = Path(__file__).parent / ".cache" / "eegnet_epochs.npz"
+CACHE_PATH = Path(__file__).parent.parent / ".cache" / "eegnet_epochs.npz"
 
 # Wider motor-strip montage (not channel pairs) -- EEGNet's spatial
 # filter needs multiple simultaneous channels to do anything meaningful.

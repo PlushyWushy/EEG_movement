@@ -1,29 +1,40 @@
 
 """
-CNN-GRU restricted to left_fist vs right_fist only (binary classification).
+CNN-GRU, WITHOUT the cleaning pipeline, restricted to left_fist vs
+right_fist only (binary classification).
 
-Same model, same training loop, same channel-pair data structuring,
-SMOTE, and cleaning pipeline as train_cnn-gru.py -- the only change is
-filtering the built 5-class dataset down to just these two classes
-(remapped to labels 0/1) right after loading, via the shared
-filter_to_classes() utility.
+Combines train_cnn-gru-raw.py's ablation (no montage/notch/ICA/bandpass)
+with the left_fist-vs-right_fist class restriction: same model, same
+channel-pair data structuring, same SMOTE, raw uncleaned signal, just
+filtered down to two classes (remapped to labels 0/1) right after
+loading, via the shared filter_to_classes() utility.
+
+Per-subject z-score normalization is still applied (numerical
+conditioning, not signal cleaning -- see load_subject_epochs_raw).
 """
 import argparse
+import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix
 
-from train_mlp import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from mlp.train_mlp import (
     N_SAMPLES,
-    build_dataset,
+    CHANNEL_PAIRS,
+    PAIR_CHANNELS,
+    build_dataset_raw,
     filter_to_classes,
     run_epoch,
     smote_augment,
     subject_dependent_split,
     subject_independent_split,
 )
+
+CACHE_PATH = Path(__file__).parent.parent / ".cache" / "mi_epochs_raw.npz"
 
 LR_CLASSES = ["left_fist", "right_fist"]
 
@@ -91,7 +102,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--patience", type=int, default=15,
+    ap.add_argument("--patience", type=int, default=200,
                      help="Early-stopping patience (epochs without val-loss improvement)")
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--test-frac", type=float, default=0.15)
@@ -111,8 +122,9 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    X, y, groups = build_dataset(max_subjects=args.max_subjects,
-                                  use_cache=not args.no_cache)
+    X, y, groups = build_dataset_raw(CACHE_PATH, PAIR_CHANNELS, expand_pairs=CHANNEL_PAIRS,
+                                      max_subjects=args.max_subjects,
+                                      use_cache=not args.no_cache)
     X, y, groups = filter_to_classes(X, y, groups, LR_CLASSES)
     print(f"Dataset (left_fist vs right_fist only): X={X.shape}, classes={LR_CLASSES}, "
           f"subjects={len(set(groups.tolist()))}")

@@ -1,15 +1,18 @@
 
 """
-CNN (~85% test accuracy)
+CNN-gru implementation
 """
 import argparse
+import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix
 
-from train_mlp import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from mlp.train_mlp import (
     CLASSES,
     N_SAMPLES,
     build_dataset,

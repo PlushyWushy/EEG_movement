@@ -1,40 +1,81 @@
 
 """
-CNN-GRU, WITHOUT the cleaning pipeline, restricted to left_fist vs
-right_fist only (binary classification).
-
-Combines train_cnn-gru-raw.py's ablation (no montage/notch/ICA/bandpass)
-with the left_fist-vs-right_fist class restriction: same model, same
-channel-pair data structuring, same SMOTE, raw uncleaned signal, just
-filtered down to two classes (remapped to labels 0/1) right after
-loading, via the shared filter_to_classes() utility.
-
-Per-subject z-score normalization is still applied (numerical
-conditioning, not signal cleaning -- see load_subject_epochs_raw).
+CNN-GRU no preprocessing 
 """
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import classification_report, confusion_matrix
 
-from train_mlp import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from mlp.train_mlp import (
+    CLASSES,
     N_SAMPLES,
     CHANNEL_PAIRS,
     PAIR_CHANNELS,
     build_dataset_raw,
-    filter_to_classes,
     run_epoch,
     smote_augment,
     subject_dependent_split,
     subject_independent_split,
 )
 
-CACHE_PATH = Path(__file__).parent / ".cache" / "mi_epochs_raw.npz"
+CACHE_PATH = Path(__file__).parent.parent / ".cache" / "mi_epochs_raw.npz"
 
-LR_CLASSES = ["left_fist", "right_fist"]
+
+def pretrain(model, loader, device, epochs, mask_frac, lr):
+    """Masked-timestep pre-training, adapted from train_multiview_transformer's
+    causal masked-chunk pre-training to this model's only internal sequence:
+    the GRU's per-timestep view of the CNN's downsampled feature map (this
+    model has no cross-epoch context, so there's no "chunk" sequence to mask
+    the way the multiview run-context model does).
+
+    A fraction of per-timestep feature vectors are replaced with a learned
+    mask token; the (already-causal) GRU has to reconstruct each masked
+    vector from strictly preceding timesteps. Only the CNN + GRU + mask
+    token are updated -- the classifier head is left for supervised training.
+    """
+    recon_head = nn.Linear(model.gru.hidden_size, model.gru.input_size).to(device)
+    params = list(model.features.parameters()) + list(model.gru.parameters()) \
+        + [model.mask_token] + list(recon_head.parameters())
+    opt = torch.optim.Adam(params, lr=lr)
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        total, n = 0.0, 0
+        for xb, _ in loader:
+            xb = xb.to(device)
+            feats = model.encode_features(xb)   # (B, T, F2)
+            B, T, _ = feats.shape
+            if T < 2:
+                continue
+
+            # never mask position 0: it has no history to predict from
+            maskable = torch.ones(B, T, dtype=torch.bool, device=device)
+            maskable[:, 0] = False
+            sel = (torch.rand(B, T, device=device) < mask_frac) & maskable
+            if not sel.any():
+                continue
+
+            feats_in = torch.where(sel.unsqueeze(-1), model.mask_token.expand(B, T, -1), feats)
+            hidden, _ = model.gru(feats_in)     # (B, T, gru_hidden), causal
+            recon = recon_head(hidden[sel])     # (M, F2)
+            target = feats[sel].detach()
+            loss = F.mse_loss(recon, target)
+
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            total += loss.item() * int(sel.sum())
+            n += int(sel.sum())
+        print(f"  pretrain epoch {ep:3d}  recon_mse={total / max(n, 1):.4f}")
+    return model
 
 
 class CNN1D(nn.Module):
@@ -70,12 +111,19 @@ class CNN1D(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(fc_dim, num_classes),
         )
+        # Used only for masked-timestep pre-training (see pretrain() below).
+        self.mask_token = nn.Parameter(torch.zeros(n_filters2))
+        nn.init.normal_(self.mask_token, std=0.02)
+
+    def encode_features(self, x):
+        # x: (batch, n_channels, n_times) -> (batch, time', n_filters2)
+        x = self.features(x)              # (batch, n_filters2, time')
+        return x.transpose(1, 2)          # time-major, what the GRU wants
 
     def forward(self, x):
         # x: (batch, n_channels, n_times)
-        x = self.features(x)              # (batch, n_filters2, time')
-        x = x.transpose(1, 2)             # (batch, time', n_filters2) -- GRU wants time-major
-        _, h_n = self.gru(x)              # h_n: (1, batch, gru_hidden), final hidden state
+        feats = self.encode_features(x)   # (batch, time', n_filters2)
+        _, h_n = self.gru(feats)          # h_n: (1, batch, gru_hidden), final hidden state
         x = h_n.squeeze(0)                # (batch, gru_hidden)
         return self.classifier(x)
 
@@ -115,6 +163,10 @@ def main():
                      help="Disable SMOTE oversampling of minority classes in the training set")
     ap.add_argument("--smote-k", type=int, default=5,
                      help="Nearest neighbors used by SMOTE (CNN-GRU paper default: 5)")
+    # pretraining
+    ap.add_argument("--pretrain-epochs", type=int, default=0)
+    ap.add_argument("--pretrain-mask-frac", type=float, default=0.3)
+    ap.add_argument("--pretrain-lr", type=float, default=1e-3)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -123,10 +175,9 @@ def main():
     X, y, groups = build_dataset_raw(CACHE_PATH, PAIR_CHANNELS, expand_pairs=CHANNEL_PAIRS,
                                       max_subjects=args.max_subjects,
                                       use_cache=not args.no_cache)
-    X, y, groups = filter_to_classes(X, y, groups, LR_CLASSES)
-    print(f"Dataset (left_fist vs right_fist only): X={X.shape}, classes={LR_CLASSES}, "
+    print(f"Dataset: X={X.shape}, classes={CLASSES}, "
           f"subjects={len(set(groups.tolist()))}")
-    print("Class counts:", {c: int((y == i).sum()) for i, c in enumerate(LR_CLASSES)})
+    print("Class counts:", {c: int((y == i).sum()) for i, c in enumerate(CLASSES)})
 
     if args.split_mode == "subject-dependent":
         train_mask, val_mask, test_mask = subject_dependent_split(
@@ -143,7 +194,7 @@ def main():
 
     if not args.no_smote:
         X_train, y_train = smote_augment(X_train, y_train, k=args.smote_k, seed=args.seed)
-        counts = {c: int((y_train == i).sum()) for i, c in enumerate(LR_CLASSES)}
+        counts = {c: int((y_train == i).sum()) for i, c in enumerate(CLASSES)}
         print(f"After SMOTE: train={len(y_train)} epochs, class counts={counts}")
 
     device = torch.device("cuda" if torch.cuda.is_available()
@@ -163,13 +214,19 @@ def main():
 
     n_channels, n_times = X_train.shape[1], X_train.shape[2]
     assert n_times == N_SAMPLES
-    model = CNN1D(n_channels, n_times, len(LR_CLASSES),
+    model = CNN1D(n_channels, n_times, len(CLASSES),
                   n_filters1=args.n_filters1, n_filters2=args.n_filters2,
                   kernel_size1=args.kernel_size1, kernel_size2=args.kernel_size2,
                   gru_hidden=args.gru_hidden,
                   fc_dim=args.fc_dim, dropout=args.dropout).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
+
+    if args.pretrain_epochs > 0:
+        print(f"\nMasked-timestep pre-training on {len(y_train)} training epochs "
+              f"(mask_frac={args.pretrain_mask_frac}):")
+        pretrain(model, train_loader, device, args.pretrain_epochs,
+                 args.pretrain_mask_frac, args.pretrain_lr)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -212,9 +269,9 @@ def main():
     all_true = np.concatenate(all_true)
 
     print("\nClassification report (test set):")
-    print(classification_report(all_true, all_preds, target_names=LR_CLASSES, digits=3))
+    print(classification_report(all_true, all_preds, target_names=CLASSES, digits=3))
     print("Confusion matrix (rows=true, cols=pred):")
-    print(LR_CLASSES)
+    print(CLASSES)
     print(confusion_matrix(all_true, all_preds))
 
 
