@@ -2,6 +2,7 @@
 Predict left vs right imagined fist from a raw EDF with a saved checkpoint
 """
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -16,7 +17,7 @@ for p in (ROOT, ROOT / "transformer", ROOT / "transformer" / "multiview",
 
 from sv_spikformer import load_model
 from train_multiview_transformer import CANONICAL_CHANNELS, make_pad_mask
-from mlp.train_mlp import EPOCH_TMIN, N_SAMPLES
+from mlp.train_mlp import EPOCH_TMIN, N_SAMPLES, RUN_LABELS
 
 SFREQ = 160.0  # what the model was trained at; anything else gets resampled
 
@@ -83,8 +84,31 @@ def read_chunks(edf_path):
     return (x - mean) / std, kept_onsets, kept_marks
 
 
+def truth_for(edf_path, marks, classes):
+    """Ground truth per chunk, or None where there is none.
+
+    The annotations ARE the answer key, but only once you know the run: T1 is
+    left_fist in runs 4/8/12 and both_fists in 6/10/14, so the run number in
+    the EEGMMIDB filename is what makes scoring possible. A file named
+    anything else scores nothing rather than guessing, and a run whose classes
+    this checkpoint was never trained on (feet, for a left/right model) is
+    left unscored too -- that mismatch is the thing worth being told about.
+    """
+    m = re.search(r"R(\d{2})\.edf$", str(edf_path), re.IGNORECASE)
+    label_map = RUN_LABELS.get(int(m.group(1))) if m else None
+    if label_map is None:
+        return [None] * len(marks), None
+    truth = [label_map.get(k) for k in marks]
+    known = {t for t in truth if t is not None}
+    if known and not (known & set(classes)):
+        print(f"  warning: run {int(m.group(1))} is a {'/'.join(sorted(known - {'baseline'}))} "
+              f"run -- this checkpoint predicts {'/'.join(classes)}, so its output "
+              f"here is meaningless")
+    return [t if t in classes else None for t in truth], int(m.group(1))
+
+
 def predict_edf(edf_path, checkpoint, device="cpu"):
-    """Returns one (onset_s, marker, label, confidence) per 4 s chunk."""
+    """Returns ([(onset_s, marker, label, confidence)], class_names)."""
     model, classes = load_model(checkpoint, device)
     x, onsets, marks = read_chunks(edf_path)
 
@@ -102,8 +126,9 @@ def predict_edf(edf_path, checkpoint, device="cpu"):
             logits.append(model(xb, make_pad_mask(lengths, xb.shape[1], device))[0].cpu())
     probs = torch.cat(logits).softmax(-1)
     conf, pred = probs.max(-1)
-    return [(o, m, classes[p], float(c))
+    rows = [(o, m, classes[p], float(c))
             for o, m, p, c in zip(onsets, marks, pred.tolist(), conf.tolist())]
+    return rows, classes
 
 
 def main():
@@ -113,8 +138,8 @@ def main():
                     help="default: newest .pt in checkpoints/")
     ap.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
     ap.add_argument("--all-chunks", action="store_true",
-                    help="also print rest (T0) chunks, which the model only "
-                         "ever saw as unlabelled context")
+                    help="also print rest (T0) chunks, which a left/right model "
+                         "only ever saw as unlabelled context")
     args = ap.parse_args()
 
     ckpt = args.checkpoint
@@ -127,21 +152,46 @@ def main():
         ckpt = found[-1]
     print(f"Checkpoint: {ckpt}\n")
 
+    grand_hit = grand_n = 0
     for path in args.edf:
         print(f"{path}")
-        rows = predict_edf(path, ckpt, args.device)
-        # T0 is rest. It carries no left/right answer and was never scored in
-        # training, so by default only the cued trials are reported.
-        task = [r for r in rows if r[1].upper() != "T0"] or rows
-        shown = rows if args.all_chunks else task
-        print(f"  {'#':>3} {'onset_s':>8} {'marker':>7} {'prediction':>11} {'conf':>6}")
-        for i, (onset, mark, label, conf) in enumerate(shown, 1):
-            print(f"  {i:>3} {onset:>8.1f} {mark:>7} {label:>11} {conf:>6.2f}")
+        rows, classes = predict_edf(path, ckpt, args.device)
+        truth, _ = truth_for(path, [r[1] for r in rows], classes)
+
+        # Rest chunks carry no answer unless the checkpoint can actually
+        # predict baseline, so by default only the cued trials are shown.
+        keep = [i for i, r in enumerate(rows)
+                if args.all_chunks or "baseline" in classes or r[1].upper() != "T0"]
+        keep = keep or list(range(len(rows)))
+
+        scored = [(rows[i][2], truth[i]) for i in keep if truth[i] is not None]
+        head = f"  {'#':>3} {'onset_s':>8} {'marker':>7} {'prediction':>11} {'conf':>6}"
+        print(head + (f" {'truth':>11}" if scored else ""))
+        for n, i in enumerate(keep, 1):
+            onset, mark, label, conf = rows[i]
+            line = f"  {n:>3} {onset:>8.1f} {mark:>7} {label:>11} {conf:>6.2f}"
+            if scored:
+                line += (f" {truth[i]:>11} {'ok' if label == truth[i] else 'MISS'}"
+                         if truth[i] is not None else f" {'-':>11}")
+            print(line)
+
         counts = {}
-        for _, _, label, _ in task:
-            counts[label] = counts.get(label, 0) + 1
-        print(f"  {len(task)} trials: " +
-              ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) + "\n")
+        for i in keep:
+            counts[rows[i][2]] = counts.get(rows[i][2], 0) + 1
+        print(f"  {len(keep)} trials: " +
+              ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+        if scored:
+            hit = sum(p == t for p, t in scored)
+            grand_hit += hit
+            grand_n += len(scored)
+            print(f"  accuracy = {hit}/{len(scored)} = {hit / len(scored):.3f}")
+        else:
+            print("  accuracy = n/a (no ground truth recoverable from this filename)")
+        print()
+
+    if grand_n and len(args.edf) > 1:
+        print(f"TOTAL: {grand_hit}/{grand_n} = {grand_hit / grand_n:.4f} "
+              f"over {len(args.edf)} files")
 
 
 if __name__ == "__main__":
