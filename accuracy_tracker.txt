@@ -1,5 +1,5 @@
 Accuracies:
-singleview spikformer (lh vs rh imagined):
+singleview spikformer (lh vs rh imagined, 90:13 split):
 Seed 42 Test accuracy = 0.8816
 Seed 43 Test accuracy = 0.9128
 Seed 44 Test accuracy = 0.8818
