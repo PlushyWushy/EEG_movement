@@ -33,7 +33,7 @@ Without preprocessing, Test accuracy=0.7809
 
 Full run, individual split:
 
-42 Test accuracy=
+42 Test accuracy=0.7357
 43 Test accuracy=0.7228
 44 Test accuracy=0.7432
 
