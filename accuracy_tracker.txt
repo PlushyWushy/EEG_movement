@@ -21,6 +21,17 @@ Seed 44 Test accuracy = 0.8390
 
 Average = 0.8487
 
+singleview SNN context length 1 (--context-len 1)
+
+Seed 42 Test accuracy = 0.8302
+Seed 43 Test accuracy = 0.8667
+Seed 44 Test accuracy = 0.8271
+
+Average = 0.8413
+
+It was also found that the data in every chunk of 15 classes are paired; all the labels on the even indices are opposite to the label before it. Thus, further evaluation on the SNN model checkpoint was conducted.
+Over the 13 held-out test subjects, it scored 89.57% overall. Considering only the first-of-pair labels, it scored 88.64%, still beating all of the no-attention ablation runs, meaning that attention still provides a significant boost despite the pairing phenomenon.
+
 cnn-gru (1 seed, 42): 
 With preprocessing, Test accuracy=0.7581
 Without preprocessing, Test accuracy=0.7493
@@ -43,3 +54,4 @@ Full run, 90:13 split:
 42 Test accuracy=0.7339
 43 Test accuracy=0.6709
 44 Test accuracy=0.6610
+
