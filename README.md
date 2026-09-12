@@ -1,10 +1,16 @@
 EEG movement project
 
-To run: 
+To run training: 
 
 python transformer/run.py --arch singleview --model spikformer --task leftright --split subject-count --train-subjects 90 --epochs 200 --patience 200  
 
+To run prediction on my latest checkpoint:
 
+python predict.py physionet.org/files/eegmmidb/1.0.0/S001/S001R04.edf
+
+If there are any troubles with the running, email me at alex_zhang2@berkeley.edu.
+
+Writeup:
 
 Explain your data processing pipeline. 
 
