@@ -6,7 +6,7 @@ python transformer/run.py --arch singleview --model spikformer --task leftright 
 
 To run prediction on my latest checkpoint:
 
-python predict.py physionet.org/files/eegmmidb/1.0.0/S001/S001R04.edf
+python predict.py path/to/edf
 
 If there are any troubles with the running, email me at alex_zhang2@berkeley.edu.
 
