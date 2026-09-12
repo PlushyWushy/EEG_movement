@@ -1,17 +1,23 @@
 EEG movement project
 
+To run: 
+
+python transformer/run.py --arch singleview --model spikformer --task leftright --split subject-count --train-subjects 90 --epochs 200 --patience 200  
+
+
+
 Explain your data processing pipeline. 
 
 I initially followed the CNN-GRU process quite closely. 
-That process cleans the raw recordings (standard montage, notch filter, ICA for eye/muscle artifacts), narrows each one down to a handful of sensorimotor channel pairs, band-passes to the motor-relevant frequency range, and cuts the signal into per-trial windows, normalizing each subject against their own signal so amplitude differences between people don't leak in. SMOTE then rebalances the training set toward the rarer classes. However, I must've done something wrong with this preprocessing, as it seems that the networks I used with it  performed worse. So, I moved away from it in favor of feeding the networks more raw signals, as each of the transformer tests were run without preprocessing with all 64 channels, though SMOTE and other augmentations were still used at training time.
+That process cleans the raw recordings (standard montage, notch filter, ICA for eye/muscle artifacts), narrows each one down to a handful of sensorimotor channel pairs, band-passes to the motor-relevant frequency range, and cuts the signal into per-trial windows, normalizing each subject against their own signal so amplitude differences between people don't leak in. SMOTE then rebalances the training set toward the rarer classes. However, I must've done something wrong with this preprocessing, as it seems that the networks I used with it performed similarly/worse. So, I moved away from it in favor of feeding the networks more raw signals, as each of the transformer tests were run without preprocessing with all 64 channels, though SMOTE and other augmentations were still used at training time.
 
 What your model can and cannot do. 
 
-The situation the main reported accuracies describe are for imagined LH vs RH, meaning, if deployed in its current state, it would be able to differentiate whether the user had imagined squeezing their left hand vs their right hand. One condition for this model is the four second interval. Since it was trained using the specific 4 second intervals provided by this dataset, it may have more trouble with shorter imagined squeeze times.
+The situation the main reported accuracies describe are for imagined LH vs RH, meaning, if deployed in its current state, it would be able to differentiate whether the user had imagined squeezing their left hand vs their right hand. One condition for this model is the four second interval. Since it was trained using the specific 4 second intervals provided by this dataset, it may have more trouble with shorter imagined squeeze times. For the range of accuracies, see accuracy_tracker.txt.
 
 That the result is not an artifact of how you measured it. 
 
-I tailored the main experiment (imagined RH vs LH) to be directly comparable to Kumar, Tang, Yoo & Michmizos 2022, as they were the highest accuracy for that task I could find. For these tests, the train-val and test sets were split. For training and validation, 90 subjects were chosen. Thus, if any overfitting happened on these 90 subjects, the test accuracy would show. This is also how Kumar et al. performed their tests. 
+I tailored the main experiment (imagined RH vs LH) to be directly comparable to Kumar, Tang, Yoo & Michmizos 2022, as they were the highest accuracy for that task I could find. For these tests, the train-val and test sets were split. For training and validation, 90 subjects were chosen. Thus, if any overfitting happened on these 90 subjects, the test accuracy would show. This is also how Kumar et al. performed their tests. This is also where the model got the 89.21% average accuracy. 
 
 For the full dataset task, I used the default individual splitting method, where each individual subject's data is split into train-val-test. Here, I originally allowed the model to guess "baseline" along with the other four classes, just like CNN-GRU did. However, this inflated the accuracy and was uncomparable to the papers I found in litreview, so I excluded that choice for the reported "full task" runs.  
 
