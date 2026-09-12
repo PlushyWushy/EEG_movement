@@ -20,7 +20,8 @@ import torch.nn.functional as F
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.neighbors import NearestNeighbors
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 from mlp.train_mlp import (
     CLASS_TO_IDX,
     CLASSES,
@@ -32,7 +33,7 @@ from mlp.train_mlp import (
     subject_dirs,
 )
 
-CACHE_DIR = Path(__file__).parent.parent / ".cache"
+CACHE_DIR = ROOT / ".cache"
 
 # The 64 channels as they appear in the EDFs (trailing dots stripped), in a
 # fixed canonical order so view indices below are stable constants.
@@ -578,6 +579,27 @@ def make_pad_mask(lengths, T, device):
     return ar >= lengths.unsqueeze(1).to(device)
 
 
+def save_checkpoint(path, **payload):
+    """torch.save wrapper shared by every --save handler: creates the parent
+    dir and confirms what was written, so a script's own state_dict is never
+    saved alone -- every caller also bundles the constructor config (and, for
+    the SNN scripts, the calibrated thresholds/token scales) needed to
+    reconstruct a working model later, not just its weights."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+    print(f"Saved checkpoint to {path}  (keys: {', '.join(sorted(payload))})")
+
+
+def load_model(path, device="cpu"):
+    """Reconstruct a MultiViewRunModel saved via --save. Returns (model, classes)."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model = MultiViewRunModel(**ckpt["config"]).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    return model, ckpt["classes"]
+
+
 def run_epoch(model, loader, criterion, optimizer, device, train):
     model.train(train)
     total_loss, correct, n = 0.0, 0, 0
@@ -647,7 +669,7 @@ def pretrain(model, loader, device, epochs, mask_frac, lr, d_model):
     return model
 
 
-def main():
+def main(task_spec=None, split_spec=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--max-subjects", type=int, default=None)
@@ -715,6 +737,11 @@ def main():
     ap.add_argument("--no-class-weights", action="store_true",
                     help="Baseline is ~50%% of chunks; weights are on by default")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--save", nargs="?", const="", default=None, metavar="PATH",
+                    help="Save the trained model to PATH after training (bare --save "
+                         "picks checkpoints/<script>_<timestamp>.pt). Bundles the "
+                         "constructor config alongside the weights so load_model() "
+                         "can reconstruct a working model, not just its state_dict.")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -724,12 +751,25 @@ def main():
     cache_path = CACHE_DIR / f"mv_seq_raw_{suffix}.npz"
     X, y, lengths, sids, runs = build_sequences(cache_path, args.max_subjects,
                                                 use_cache=not args.no_cache)
+    # Task hook. A variant script passes a spec that narrows the label problem
+    # (see transformer/leftright.py); None keeps the full 5-class task, so this
+    # script's own behaviour is unchanged.
+    classes = CLASSES
+    if task_spec is not None:
+        X, y, lengths, sids, runs = task_spec.filter(X, y, lengths, sids, runs)
+        classes = task_spec.classes
+        print(f"\nTask: {task_spec.name}  ->  classes={classes}")
     print(f"Sequences: X={X.shape} (n_runs, T_max, channels, times), "
           f"subjects={len(set(sids.tolist()))}")
-    counts = {c: int((y == i).sum()) for i, c in enumerate(CLASSES)}
+    counts = {c: int((y == i).sum()) for i, c in enumerate(classes)}
     print("Chunk counts:", counts)
 
-    if args.split_mode == "run-holdout":
+    # Split hook, same idea as the task hook: a variant or the master runner
+    # can hand over its own splitter (see transformer/splits.py). None keeps
+    # this script's own --split-mode behaviour.
+    if split_spec is not None:
+        tr_idx, va_idx, te_idx = split_spec(sids, runs, args.seed)
+    elif args.split_mode == "run-holdout":
         tr_idx, va_idx, te_idx = run_holdout_split(sids, runs, seed=args.seed)
     else:
         tr_idx, va_idx, te_idx = subject_holdout_split(sids, seed=args.seed)
@@ -775,16 +815,23 @@ def main():
                           else "cpu")
     print(f"Using device: {device}")
 
-    model = MultiViewRunModel(
+    model_config = dict(
+        n_classes=len(classes),
         d_model=args.d_model, tie_sm=not args.no_tie_sm,
         ctx_layers=args.ctx_layers, ctx_heads=args.ctx_heads,
         dropout=args.dropout, max_len=X.shape[1],
         context_weight=args.context_weight,
         freeze_context=args.freeze_context_weight,
         context_len=args.context_len, f1=args.f1, depth=args.depth,
-    ).to(device)
+    )
+    model = MultiViewRunModel(**model_config).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,} "
           f"(sensorimotor encoders {'tied' if not args.no_tie_sm else 'independent'})")
+
+    save_path = None
+    if args.save is not None:
+        save_path = args.save or str(ROOT / "checkpoints" /
+            f"{Path(__file__).stem}_{time.strftime('%Y%m%d-%H%M%S')}.pt")
 
     if args.pretrain_epochs > 0:
         print(f"\nCausal masked-chunk pre-training on {len(tr_idx)} training runs "
@@ -796,11 +843,11 @@ def main():
         weight = None
     else:
         train_y = y[tr_idx]
-        freq = np.array([max((train_y == i).sum(), 1) for i in range(len(CLASSES))],
+        freq = np.array([max((train_y == i).sum(), 1) for i in range(len(classes))],
                         dtype=np.float64)
-        weight = torch.tensor((freq.sum() / (len(CLASSES) * freq)),
+        weight = torch.tensor((freq.sum() / (len(classes) * freq)),
                               dtype=torch.float32, device=device)
-        print("Class weights:", {c: round(float(w), 3) for c, w in zip(CLASSES, weight)})
+        print("Class weights:", {c: round(float(w), 3) for c, w in zip(classes, weight)})
 
     criterion = nn.CrossEntropyLoss(weight=weight, ignore_index=-1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
@@ -843,15 +890,19 @@ def main():
     preds, trues = np.concatenate(preds), np.concatenate(trues)
 
     print("\nClassification report (test set):")
-    print(classification_report(trues, preds, labels=list(range(len(CLASSES))),
-                                target_names=CLASSES, digits=3, zero_division=0))
-    task = trues != CLASS_TO_IDX["baseline"]
+    print(classification_report(trues, preds, labels=list(range(len(classes))),
+                                target_names=classes, digits=3, zero_division=0))
+    task = (trues != classes.index("baseline")) if "baseline" in classes else np.zeros(0, bool)
     if task.any():
         print(f"Task-only accuracy (baseline chunks excluded): "
               f"{(preds[task] == trues[task]).mean():.4f}")
     print("Confusion matrix (rows=true, cols=pred):")
-    print(CLASSES)
-    print(confusion_matrix(trues, preds, labels=list(range(len(CLASSES)))))
+    print(classes)
+    print(confusion_matrix(trues, preds, labels=list(range(len(classes)))))
+
+    if save_path:
+        save_checkpoint(save_path, model_state=model.state_dict(),
+                        config=model_config, classes=classes)
 
 
 if __name__ == "__main__":

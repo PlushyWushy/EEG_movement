@@ -1,0 +1,38 @@
+Accuracies:
+singleview spikformer:
+Seed 42 Test accuracy = 0.8816
+Seed 43 Test accuracy = 0.9128
+Seed 44 Test accuracy = 0.8818
+
+Average = 0.8921 
+
+singleview ANN:
+Seed 42 Test accuracy = 0.8645
+Seed 43 Test accuracy = 0.9111
+Seed 44 Test accuracy = 0.8887
+
+Average = 0.8881
+
+
+singleview ANN noattention:
+Seed 42 Test accuracy = 0.8491
+Seed 43 Test accuracy = 0.8581
+Seed 44 Test accuracy = 0.8390
+
+Average = 0.8487
+
+cnn-gru (1 seed, 42): 
+With preprocessing, Test accuracy=0.7581
+Without preprocessing
+
+EEGnet (1 seed, 42):
+With preprocessing, Test accuracy=0.6839
+Without preprocessing, Test accuracy=0.7809
+
+Full run, 90:13 split:
+
+42 Test accuracy=0.7339
+43 Test accuracy=0.6709
+44 Test accuracy=0.6610
+
+Full run, individual split:

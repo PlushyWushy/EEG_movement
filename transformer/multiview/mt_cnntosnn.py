@@ -1,6 +1,6 @@
 
 """
-CNN-gru multiview
+SNN multiview
 """
 import argparse
 import sys
@@ -15,7 +15,8 @@ import torch.nn.functional as F
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.neighbors import NearestNeighbors
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 from mlp.train_mlp import (
     CLASS_TO_IDX,
     CLASSES,
@@ -27,7 +28,7 @@ from mlp.train_mlp import (
     subject_dirs,
 )
 
-CACHE_DIR = Path(__file__).parent.parent / ".cache"
+CACHE_DIR = ROOT / ".cache"
 
 # The 64 channels as they appear in the EDFs (trailing dots stripped), in a
 # fixed canonical order so view indices below are stable constants.
@@ -422,64 +423,60 @@ class RunSequenceDataset(torch.utils.data.Dataset):
 # --------------------------------------------------------------------------
 
 class ViewEncoder(nn.Module):
-    """Compact CNN-GRU-style encoder for ONE view: 1D conv stack over that
-    view's channels, collapsing time down to a short sequence of feature
-    vectors, then a GRU whose final hidden state becomes the d_model
-    embedding for the chunk. Mirrors the CNN1D architecture in
-    train_cnn-gru.py; filters/hidden size are scaled down from that file's
-    defaults since this module gets instantiated 5x (one per view) and each
-    view has far fewer channels than the full 64-channel montage."""
+    """Compact EEGNet-style CNN for ONE view: temporal conv -> depthwise
+    spatial conv collapsing that view's channels -> separable conv -> a
+    d_model embedding for the chunk. Kept small on purpose; the unique-trial
+    count here is modest and this is the module that gets instantiated 5x.
 
-    def __init__(self, n_channels, d_model, n_filters1=16, n_filters2=16,
-                 kernel_size1=20, kernel_size2=6, gru_hidden=32, dropout=0.4):
+    Two departures from the parent script, both there to make this module
+    convertible (see the module docstring): the nn.Sequential is unrolled
+    into named submodules so SpikingViewEncoder can address each conv,
+    BatchNorm and activation, and the two ELUs are ReLUs so their output
+    maps onto a firing rate. Everything else -- layer order, kernel sizes,
+    groups, bias=False, pooling, dropout -- is unchanged."""
+
+    def __init__(self, n_channels, d_model, f1=8, depth=2, dropout=0.4):
         super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv1d(n_channels, n_filters1, kernel_size1, padding="same"),
-            nn.BatchNorm1d(n_filters1),
-            nn.ReLU(),
+        f2 = f1 * depth
+        # ~0.4 s temporal kernel at 160 Hz -- spans mu/beta cycles
+        self.temporal = nn.Conv2d(1, f1, (1, 65), padding="same", bias=False)
+        self.bn1 = nn.BatchNorm2d(f1)
+        self.spatial = nn.Conv2d(f1, f2, (n_channels, 1), groups=f1, bias=False)
+        self.bn2 = nn.BatchNorm2d(f2)
+        self.act1 = nn.ReLU()
+        self.pool1 = nn.AvgPool2d((1, 4))
+        self.drop1 = nn.Dropout(dropout)
+        self.sep_depth = nn.Conv2d(f2, f2, (1, 15), padding="same", groups=f2,
+                                   bias=False)
+        self.sep_point = nn.Conv2d(f2, f2, (1, 1), bias=False)
+        self.bn3 = nn.BatchNorm2d(f2)
+        self.act2 = nn.ReLU()
+        self.pool2 = nn.AvgPool2d((1, 8))
+        self.drop2 = nn.Dropout(dropout)
+        self.proj = nn.Linear(f2 * (N_SAMPLES // 32), d_model)
 
-            nn.Conv1d(n_filters1, n_filters2, kernel_size1, padding="valid"),
-            nn.BatchNorm1d(n_filters2),
-            nn.ReLU(),
-            nn.Dropout1d(dropout),
-
-            nn.Conv1d(n_filters2, n_filters2, kernel_size2, padding="valid"),
-            nn.ReLU(),
-            nn.AvgPool1d(4),
-
-            nn.Conv1d(n_filters2, n_filters2, kernel_size2, padding="valid"),
-            nn.ReLU(),
-            nn.Dropout1d(dropout),
-            nn.AvgPool1d(2),
-        )
-        self.gru = nn.GRU(input_size=n_filters2, hidden_size=gru_hidden, batch_first=True)
-        self.proj = nn.Linear(gru_hidden, d_model)
-
-    def forward(self, x):             # x: (N, C_view, 640)
-        h = self.features(x)          # (N, n_filters2, T')
-        h = h.transpose(1, 2)         # (N, T', n_filters2) -- GRU wants time-major
-        _, h_n = self.gru(h)          # h_n: (1, N, gru_hidden), final hidden state
-        return self.proj(h_n.squeeze(0))
+    def forward(self, x):                         # x: (N, C_view, 640)
+        h = self.bn2(self.spatial(self.bn1(self.temporal(x.unsqueeze(1)))))
+        h = self.drop1(self.pool1(self.act1(h)))
+        h = self.bn3(self.sep_point(self.sep_depth(h)))
+        h = self.drop2(self.pool2(self.act2(h)))  # (N, f2, 1, 20)
+        return self.proj(h.flatten(1))
 
 
 class MultiViewChunkEncoder(nn.Module):
-    """Encodes one 4 s chunk into a single vector: per-view CNN-GRU -> 5 view
+    """Encodes one 4 s chunk into a single vector: per-view CNN -> 5 view
     tokens (+ learned view embeddings) -> 1 attention layer fusing views ->
     mean pool. The fusion layer is where laterality gets read out."""
 
-    def __init__(self, d_model, tie_sm=True, n_heads=4, dropout=0.3,
-                 n_filters1=16, n_filters2=16, kernel_size1=20, kernel_size2=6,
-                 gru_hidden=32):
+    def __init__(self, d_model, tie_sm=True, n_heads=4, dropout=0.3, f1=8, depth=2):
         super().__init__()
         self.tie_sm = tie_sm
         encoders = {}
         for v in VIEW_NAMES:
             if tie_sm and v == TIED_VIEWS[1]:
                 continue  # shares the left encoder
-            encoders[v] = ViewEncoder(len(VIEWS[v]), d_model,
-                                      n_filters1=n_filters1, n_filters2=n_filters2,
-                                      kernel_size1=kernel_size1, kernel_size2=kernel_size2,
-                                      gru_hidden=gru_hidden, dropout=dropout)
+            encoders[v] = ViewEncoder(len(VIEWS[v]), d_model, f1=f1, depth=depth,
+                                      dropout=dropout)
         self.encoders = nn.ModuleDict(encoders)
         self.view_emb = nn.Parameter(torch.zeros(len(VIEW_NAMES), d_model))
         nn.init.normal_(self.view_emb, std=0.02)
@@ -505,13 +502,10 @@ class MultiViewRunModel(nn.Module):
     def __init__(self, d_model=128, n_classes=len(CLASSES), tie_sm=True,
                  ctx_layers=2, ctx_heads=4, dropout=0.3, max_len=64,
                  context_weight=0.1, freeze_context=False, context_len=0,
-                 n_filters1=16, n_filters2=16, kernel_size1=20, kernel_size2=6,
-                 gru_hidden=32):
+                 f1=8, depth=2):
         super().__init__()
-        self.chunk_encoder = MultiViewChunkEncoder(
-            d_model, tie_sm=tie_sm, dropout=dropout,
-            n_filters1=n_filters1, n_filters2=n_filters2,
-            kernel_size1=kernel_size1, kernel_size2=kernel_size2, gru_hidden=gru_hidden)
+        self.chunk_encoder = MultiViewChunkEncoder(d_model, tie_sm=tie_sm,
+                                                   dropout=dropout, f1=f1, depth=depth)
         # positional info lives only on the context path, so the local path
         # (and therefore the context_weight=0 ablation) stays position-free
         self.pos = nn.Embedding(max_len, d_model)
@@ -595,6 +589,18 @@ def make_pad_mask(lengths, T, device):
     return ar >= lengths.unsqueeze(1).to(device)
 
 
+def save_checkpoint(path, **payload):
+    """torch.save wrapper shared by every --save handler here: creates the
+    parent dir and confirms what was written, so a bare state_dict is never
+    saved alone -- callers also bundle the constructor config (and, for the
+    SNN scripts, the calibrated thresholds) needed to reconstruct a working
+    model later."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+    print(f"Saved checkpoint to {path}  (keys: {', '.join(sorted(payload))})")
+
+
 def run_epoch(model, loader, criterion, optimizer, device, train):
     model.train(train)
     total_loss, correct, n = 0.0, 0, 0
@@ -664,7 +670,305 @@ def pretrain(model, loader, device, epochs, mask_frac, lr, d_model):
     return model
 
 
-def main():
+
+# --------------------------------------------------------------------------
+# ANN -> SNN conversion of the per-view CNNs
+# --------------------------------------------------------------------------
+
+ACT_LAYERS = ("act1", "act2")
+
+
+def encoder_key(view, tie_sm):
+    """Which entry of MultiViewChunkEncoder.encoders actually runs `view`
+    (the two sensorimotor views share one encoder when tied)."""
+    return TIED_VIEWS[0] if (tie_sm and view == TIED_VIEWS[1]) else view
+
+
+def fold_conv_bn(conv, bn):
+    """Fuse Conv2d + BatchNorm2d into a single equivalent Conv2d. Every conv
+    in ViewEncoder is bias=False, so the fused bias comes entirely from
+    BatchNorm's learned shift. The BN must be in eval mode -- running
+    statistics are what gets folded."""
+    fused = nn.Conv2d(conv.in_channels, conv.out_channels, conv.kernel_size,
+                      stride=conv.stride, padding=conv.padding,
+                      dilation=conv.dilation, groups=conv.groups,
+                      bias=True).to(conv.weight.device)
+    scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
+    conv_bias = conv.bias if conv.bias is not None \
+        else torch.zeros(conv.out_channels, device=conv.weight.device)
+    with torch.no_grad():
+        fused.weight.copy_(conv.weight * scale.view(-1, 1, 1, 1))
+        fused.bias.copy_((conv_bias - bn.running_mean) * scale + bn.bias)
+    fused.eval()
+    for param in fused.parameters():
+        param.requires_grad_(False)
+    return fused
+
+
+def robust_max(act, percentile, max_elems=1 << 22):
+    """A high percentile rather than the raw max, so one outlier activation
+    can't inflate a threshold and starve that layer of spikes (Rueckauer et
+    al. 2017). Sampled down first: torch.quantile refuses very large inputs,
+    and one calibration batch of act1 is tens of millions of values."""
+    act = act.detach().flatten().float().cpu()
+    if act.numel() > max_elems:
+        act = act[torch.randint(act.numel(), (max_elems,))]
+    return torch.quantile(act, percentile / 100.0).item()
+
+
+@torch.no_grad()
+def calibrate_thresholds(model, loader, device, n_batches, percentile):
+    """One threshold per (view encoder, activation), taken over unaugmented
+    training chunks.
+
+    Padded positions are dropped before encoding: they are all-zero, and
+    letting a third of the calibration set be zeros would drag every
+    percentile down. The tied sensorimotor encoder is hooked once and
+    called twice per chunk, so it is calibrated on both views' activations,
+    which is right -- it is the same weights seeing both.
+    """
+    model.eval()
+    chunk_enc = model.chunk_encoder
+    thresholds = {k: {a: 0.0 for a in ACT_LAYERS} for k in chunk_enc.encoders}
+
+    def make_hook(key, act):
+        def hook(module, inp, out):
+            thresholds[key][act] = max(thresholds[key][act],
+                                       robust_max(out, percentile))
+        return hook
+
+    handles = [getattr(enc, act).register_forward_hook(make_hook(key, act))
+               for key, enc in chunk_enc.encoders.items() for act in ACT_LAYERS]
+    try:
+        for i, (xb, _, lb) in enumerate(loader):
+            if i >= n_batches:
+                break
+            xb = xb.to(device)
+            valid = ~make_pad_mask(lb, xb.shape[1], device)
+            chunk_enc(xb[valid])
+    finally:
+        for h in handles:
+            h.remove()
+
+    # A layer that never fired on the calibration set would otherwise give a
+    # zero threshold and divide-by-zero spiking; floor it and say so.
+    for key, th in thresholds.items():
+        for act, v in th.items():
+            if v <= 0.0:
+                print(f"  WARNING: {key}.{act} never activated during "
+                      f"calibration; flooring its threshold")
+                th[act] = 1e-4
+    return thresholds
+
+
+class SpikingViewEncoder:
+    """One trained ViewEncoder run as a spiking convolutional network.
+
+    Weights are copied unchanged (BatchNorm folded into its preceding conv)
+    and each ReLU becomes a subtractive-reset integrate-and-fire neuron with
+    the calibrated threshold. Spikes are transmitted scaled by that
+    threshold: this is threshold balancing with the per-layer gain folded
+    into the downstream weights, where it would live on hardware anyway. The
+    scaling is what makes a firing rate r = a/theta arrive at the next conv
+    as the activation `a` the ANN would have sent, so biases need no
+    rescaling and the time-averaged output converges on the ANN's own
+    embedding rather than a shrunken copy of it.
+
+    temporal->bn1->spatial->bn2 is a purely linear run -- no activation sits
+    between them in the ANN -- so it composes into one operator, and since
+    the analog input is constant across timesteps it is evaluated once
+    outside the loop rather than redundantly inside it. Spikes appear only
+    where the ANN itself had a nonlinearity. `proj` stays a non-spiking
+    accumulator: it is the handoff to the ANN transformer, which wants a
+    real-valued token, not a spike train.
+    """
+
+    def __init__(self, enc, thresholds):
+        self.pre = nn.Sequential(fold_conv_bn(enc.temporal, enc.bn1),
+                                 fold_conv_bn(enc.spatial, enc.bn2))
+        self.mid = nn.Sequential(enc.sep_depth,
+                                 fold_conv_bn(enc.sep_point, enc.bn3))
+        self.pool1, self.pool2, self.proj = enc.pool1, enc.pool2, enc.proj
+        self.thr1, self.thr2 = thresholds["act1"], thresholds["act2"]
+
+    @staticmethod
+    def _if_step(cur, mem, threshold):
+        mem = mem + cur
+        # Zero floor: these neurons have no leak, so a unit whose ANN
+        # activation is 0 (net negative input current) would integrate an
+        # unboundedly negative membrane and stay unresponsive for the rest
+        # of the simulation. Clamping at 0 keeps "silent" and "deeply
+        # inhibited" the same state, which is what ReLU does.
+        mem = mem.clamp(min=0.0)
+        spk = (mem >= threshold).float()
+        return spk, mem - spk * threshold
+
+    @torch.no_grad()
+    def run(self, x, timesteps, checkpoints):
+        """x: (N, C_view, 640) -> ({t: (N, d_model)}, mean spike rates)."""
+        cur1 = self.pre(x.unsqueeze(1))     # constant across timesteps
+        mem1, mem2, acc = torch.zeros_like(cur1), None, None
+        spike_sums = {a: 0.0 for a in ACT_LAYERS}
+        emb_by_t = {}
+
+        for t in range(1, timesteps + 1):
+            spk1, mem1 = self._if_step(cur1, mem1, self.thr1)
+            cur2 = self.mid(self.pool1(spk1 * self.thr1))
+            if mem2 is None:
+                mem2 = torch.zeros_like(cur2)
+            spk2, mem2 = self._if_step(cur2, mem2, self.thr2)
+
+            emb = self.proj(self.pool2(spk2 * self.thr2).flatten(1))
+            acc = emb if acc is None else acc + emb
+            spike_sums["act1"] += spk1.mean().item()
+            spike_sums["act2"] += spk2.mean().item()
+            if t in checkpoints:
+                emb_by_t[t] = acc / t
+
+        return emb_by_t, {a: s / timesteps for a, s in spike_sums.items()}
+
+
+class SpikingChunkEncoder:
+    """MultiViewChunkEncoder with every per-view CNN swapped for its spiking
+    counterpart. The learned view embeddings and the fusion attention layer
+    are the trained model's own ANN modules, called unchanged -- they just
+    receive rate-decoded chunk tokens instead of ANN ones."""
+
+    def __init__(self, chunk_encoder, thresholds):
+        self.tie_sm = chunk_encoder.tie_sm
+        self.encoders = {key: SpikingViewEncoder(enc, thresholds[key])
+                         for key, enc in chunk_encoder.encoders.items()}
+        self.view_emb = chunk_encoder.view_emb
+        self.fuse = chunk_encoder.fuse
+
+    @torch.no_grad()
+    def forward(self, x, timesteps, checkpoints):
+        """x: (N, 64, 640) -> ({t: (N, d_model)}, per-view spike rates).
+
+        Rates are keyed by view rather than by encoder, so a tied
+        sensorimotor encoder reports separately for the left and right
+        views it was run on."""
+        toks = {t: [] for t in checkpoints}
+        rates = {}
+        for vi, v in enumerate(VIEW_NAMES):
+            idx = torch.as_tensor(_view_idx[v], device=x.device)
+            emb_by_t, view_rates = self.encoders[encoder_key(v, self.tie_sm)].run(
+                x.index_select(1, idx), timesteps, checkpoints)
+            for t, emb in emb_by_t.items():
+                toks[t].append(emb + self.view_emb[vi])
+            for act, r in view_rates.items():
+                rates[f"{v}.{act}"] = r
+        return ({t: self.fuse(torch.stack(v, dim=1)).mean(dim=1)
+                 for t, v in toks.items()}, rates)
+
+
+class HybridSNNModel:
+    """MultiViewRunModel with a spiking front end: spiking per-view CNNs ->
+    ANN view fusion -> ANN causal context transformer -> ANN head. Only the
+    convolutions changed; everything from the view tokens upward is the
+    trained model's own modules, called as they are. Inference only.
+
+    `chunk_batch` caps how many chunks are simulated at once: the outer
+    dataloader batches whole runs, so one batch can be several hundred
+    chunks x 5 views x T timesteps of live activation.
+    """
+
+    def __init__(self, model, thresholds, chunk_batch=64):
+        self.model = model
+        self.chunk_encoder = SpikingChunkEncoder(model.chunk_encoder, thresholds)
+        self.chunk_batch = chunk_batch
+
+    @torch.no_grad()
+    def forward(self, x, pad_mask, timesteps, checkpoints):
+        """x: (B, T, 64, 640) -> ({t: logits}, mean spike rates)."""
+        B, T = x.shape[:2]
+        d = self.model.pos.embedding_dim
+        keep = (~pad_mask).reshape(-1)
+        # Padded positions are dropped rather than simulated: they are
+        # zero-padding, the context attention masks them out as keys and
+        # they carry no label, so simulating them buys nothing but runtime.
+        # Their tokens stay at zero.
+        chunks = x.reshape(B * T, x.shape[2], x.shape[3])[keep]
+
+        parts = {t: [] for t in checkpoints}
+        rate_sums, n_parts = {}, 0
+        for i in range(0, len(chunks), self.chunk_batch):
+            emb_by_t, rates = self.chunk_encoder.forward(
+                chunks[i:i + self.chunk_batch], timesteps, checkpoints)
+            for t, emb in emb_by_t.items():
+                parts[t].append(emb)
+            for k, r in rates.items():
+                rate_sums[k] = rate_sums.get(k, 0.0) + r
+            n_parts += 1
+
+        logits = {}
+        for t in checkpoints:
+            local = torch.zeros(B * T, d, device=x.device)
+            local[keep] = torch.cat(parts[t])
+            local = local.reshape(B, T, d)
+            ctx = self.model.apply_context(local, pad_mask)
+            logits[t] = self.model.head(
+                self.model.norm(local + self.model.context_gate * ctx))
+        return logits, {k: r / max(n_parts, 1) for k, r in rate_sums.items()}
+
+
+def load_model(path, device="cpu"):
+    """Reconstruct the trained ANN saved via --save. Returns (model,
+    thresholds, classes) -- thresholds is None if the checkpoint was saved
+    with --no-snn before calibration ran. Wrap the result in
+    HybridSNNModel(model, thresholds) to run it as the converted spiking
+    network."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model = MultiViewRunModel(**ckpt["config"]).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    return model, ckpt.get("thresholds"), ckpt["classes"]
+
+
+@torch.no_grad()
+def evaluate_hybrid(hybrid, loader, device, timesteps, checkpoints,
+                    limit_batches=0):
+    """Run the hybrid at every checkpoint T, and the unconverted ANN on
+    exactly the same chunks. Evaluating both here (rather than reusing the
+    full-test ANN number) keeps the comparison honest when
+    --snn-limit-batches shortens the SNN pass."""
+    hybrid.model.eval()
+    preds = {t: [] for t in checkpoints}
+    ann_preds, trues = [], []
+    rate_sums, n_batches = {}, 0
+
+    for i, (xb, yb, lb) in enumerate(loader):
+        if limit_batches and i >= limit_batches:
+            break
+        xb, lb = xb.to(device), lb.to(device)
+        pad_mask = make_pad_mask(lb, xb.shape[1], device)
+        t0 = time.time()
+        logits_by_t, rates = hybrid.forward(xb, pad_mask, timesteps, checkpoints)
+        valid = yb.reshape(-1) != -1
+
+        for t, logits in logits_by_t.items():
+            preds[t].append(
+                logits.reshape(-1, logits.shape[-1]).argmax(1).cpu()[valid].numpy())
+        ann_logits = hybrid.model(xb, pad_mask)
+        ann_preds.append(
+            ann_logits.reshape(-1, ann_logits.shape[-1]).argmax(1).cpu()[valid].numpy())
+        trues.append(yb.reshape(-1)[valid].numpy())
+
+        for k, r in rates.items():
+            rate_sums[k] = rate_sums.get(k, 0.0) + r
+        n_batches += 1
+        print(f"  [SNN] batch {i + 1}: {int(valid.sum())} chunks x 5 views "
+              f"simulated for T={timesteps} ({time.time() - t0:.1f}s)", flush=True)
+
+    trues = np.concatenate(trues)
+    acc_by_t = {t: float((np.concatenate(preds[t]) == trues).mean())
+                for t in checkpoints}
+    spike_rates = {k: r / max(n_batches, 1) for k, r in rate_sums.items()}
+    return (acc_by_t, trues, np.concatenate(preds[max(checkpoints)]),
+            np.concatenate(ann_preds), spike_rates)
+
+
+def main(task_spec=None, split_spec=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--max-subjects", type=int, default=None)
@@ -677,16 +981,8 @@ def main():
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--ctx-layers", type=int, default=2)
     ap.add_argument("--ctx-heads", type=int, default=4)
-    ap.add_argument("--n-filters1", type=int, default=16,
-                    help="ViewEncoder conv1/conv2 filter count")
-    ap.add_argument("--n-filters2", type=int, default=16,
-                    help="ViewEncoder conv3/conv4 filter count")
-    ap.add_argument("--kernel-size1", type=int, default=20,
-                    help="ViewEncoder conv1/conv2 kernel size (CNN-GRU paper: 20)")
-    ap.add_argument("--kernel-size2", type=int, default=6,
-                    help="ViewEncoder conv3/conv4 kernel size (CNN-GRU paper: 6)")
-    ap.add_argument("--gru-hidden", type=int, default=32,
-                    help="ViewEncoder GRU hidden size")
+    ap.add_argument("--f1", type=int, default=8, help="ViewEncoder temporal filters")
+    ap.add_argument("--depth", type=int, default=2, help="ViewEncoder depth multiplier")
     ap.add_argument("--dropout", type=float, default=0.3)
     ap.add_argument("--no-tie-sm", action="store_true",
                     help="Give the two sensorimotor views independent encoders")
@@ -740,6 +1036,31 @@ def main():
     ap.add_argument("--no-class-weights", action="store_true",
                     help="Baseline is ~50%% of chunks; weights are on by default")
     ap.add_argument("--seed", type=int, default=42)
+    # ANN -> SNN conversion of the per-view CNNs (post-training, no retraining)
+    ap.add_argument("--no-snn", action="store_true",
+                    help="Stop after the ANN evaluation, skipping the conversion")
+    ap.add_argument("--timesteps", type=int, default=128,
+                    help="Longest SNN simulation length (rate-coding timesteps)")
+    ap.add_argument("--timestep-checkpoints", type=str, default="8,16,32,64,128",
+                    help="Comma-separated T values to report accuracy at "
+                         "(capped at --timesteps)")
+    ap.add_argument("--calib-batches", type=int, default=10,
+                    help="Unaugmented training batches used for threshold calibration")
+    ap.add_argument("--calib-percentile", type=float, default=99.9,
+                    help="Percentile of calibration activations used as each IF "
+                         "neuron's threshold (robust max, Rueckauer et al. 2017)")
+    ap.add_argument("--snn-chunk-batch", type=int, default=64,
+                    help="Chunks simulated at once; lower it if the SNN pass runs "
+                         "out of memory (a batch of runs is hundreds of chunks)")
+    ap.add_argument("--snn-limit-batches", type=int, default=0,
+                    help="Evaluate the SNN on only the first N test batches "
+                         "(0 = all). The ANN reference is recomputed on the same "
+                         "chunks, so the comparison stays valid")
+    ap.add_argument("--save", nargs="?", const="", default=None, metavar="PATH",
+                    help="Save the trained ANN to PATH (bare --save picks "
+                         "checkpoints/<script>_<timestamp>.pt). Saved once after ANN "
+                         "training (or, if --no-snn wasn't passed, again at the end "
+                         "with calibrated thresholds included) -- see load_model().")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -749,12 +1070,25 @@ def main():
     cache_path = CACHE_DIR / f"mv_seq_raw_{suffix}.npz"
     X, y, lengths, sids, runs = build_sequences(cache_path, args.max_subjects,
                                                 use_cache=not args.no_cache)
+    # Task hook. A variant script passes a spec that narrows the label problem
+    # (see transformer/leftright.py); None keeps the full 5-class task, so this
+    # script's own behaviour is unchanged.
+    classes = CLASSES
+    if task_spec is not None:
+        X, y, lengths, sids, runs = task_spec.filter(X, y, lengths, sids, runs)
+        classes = task_spec.classes
+        print(f"\nTask: {task_spec.name}  ->  classes={classes}")
     print(f"Sequences: X={X.shape} (n_runs, T_max, channels, times), "
           f"subjects={len(set(sids.tolist()))}")
-    counts = {c: int((y == i).sum()) for i, c in enumerate(CLASSES)}
+    counts = {c: int((y == i).sum()) for i, c in enumerate(classes)}
     print("Chunk counts:", counts)
 
-    if args.split_mode == "run-holdout":
+    # Split hook, same idea as the task hook: a variant or the master runner
+    # can hand over its own splitter (see transformer/splits.py). None keeps
+    # this script's own --split-mode behaviour.
+    if split_spec is not None:
+        tr_idx, va_idx, te_idx = split_spec(sids, runs, args.seed)
+    elif args.split_mode == "run-holdout":
         tr_idx, va_idx, te_idx = run_holdout_split(sids, runs, seed=args.seed)
     else:
         tr_idx, va_idx, te_idx = subject_holdout_split(sids, seed=args.seed)
@@ -800,19 +1134,27 @@ def main():
                           else "cpu")
     print(f"Using device: {device}")
 
-    model = MultiViewRunModel(
+    model_config = dict(
+        n_classes=len(classes),
         d_model=args.d_model, tie_sm=not args.no_tie_sm,
         ctx_layers=args.ctx_layers, ctx_heads=args.ctx_heads,
         dropout=args.dropout, max_len=X.shape[1],
         context_weight=args.context_weight,
         freeze_context=args.freeze_context_weight,
-        context_len=args.context_len,
-        n_filters1=args.n_filters1, n_filters2=args.n_filters2,
-        kernel_size1=args.kernel_size1, kernel_size2=args.kernel_size2,
-        gru_hidden=args.gru_hidden,
-    ).to(device)
+        context_len=args.context_len, f1=args.f1, depth=args.depth,
+    )
+    model = MultiViewRunModel(**model_config).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,} "
           f"(sensorimotor encoders {'tied' if not args.no_tie_sm else 'independent'})")
+
+    save_path = None
+    if args.save is not None:
+        save_path = args.save or str(ROOT / "checkpoints" /
+            f"{Path(__file__).stem}_{time.strftime('%Y%m%d-%H%M%S')}.pt")
+
+    def save_now(**extra):
+        save_checkpoint(save_path, model_state=model.state_dict(), config=model_config,
+                        classes=classes, **extra)
 
     if args.pretrain_epochs > 0:
         print(f"\nCausal masked-chunk pre-training on {len(tr_idx)} training runs "
@@ -824,11 +1166,11 @@ def main():
         weight = None
     else:
         train_y = y[tr_idx]
-        freq = np.array([max((train_y == i).sum(), 1) for i in range(len(CLASSES))],
+        freq = np.array([max((train_y == i).sum(), 1) for i in range(len(classes))],
                         dtype=np.float64)
-        weight = torch.tensor((freq.sum() / (len(CLASSES) * freq)),
+        weight = torch.tensor((freq.sum() / (len(classes) * freq)),
                               dtype=torch.float32, device=device)
-        print("Class weights:", {c: round(float(w), 3) for c, w in zip(CLASSES, weight)})
+        print("Class weights:", {c: round(float(w), 3) for c, w in zip(classes, weight)})
 
     criterion = nn.CrossEntropyLoss(weight=weight, ignore_index=-1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
@@ -855,8 +1197,8 @@ def main():
         model.load_state_dict(best_state)
 
     test_loss, test_acc = run_epoch(model, test_loader, criterion, optimizer, device, False)
-    print(f"\nTest loss={test_loss:.4f}  Test accuracy={test_acc:.4f}")
-    print(f"Learned context gate: {model.context_gate.item():.4f}  "
+    print(f"\n[ANN] Test loss={test_loss:.4f}  Test accuracy={test_acc:.4f}")
+    print(f"[ANN] Learned context gate: {model.context_gate.item():.4f}  "
           f"(initialised at {args.context_weight}; how much history the model wanted)")
 
     model.eval()
@@ -870,16 +1212,83 @@ def main():
             trues.append(yb.reshape(-1)[valid].numpy())
     preds, trues = np.concatenate(preds), np.concatenate(trues)
 
-    print("\nClassification report (test set):")
-    print(classification_report(trues, preds, labels=list(range(len(CLASSES))),
-                                target_names=CLASSES, digits=3, zero_division=0))
-    task = trues != CLASS_TO_IDX["baseline"]
+    print("\n[ANN] Classification report (test set):")
+    print(classification_report(trues, preds, labels=list(range(len(classes))),
+                                target_names=classes, digits=3, zero_division=0))
+    task = (trues != classes.index("baseline")) if "baseline" in classes else np.zeros(0, bool)
     if task.any():
-        print(f"Task-only accuracy (baseline chunks excluded): "
+        print(f"[ANN] Task-only accuracy (baseline chunks excluded): "
               f"{(preds[task] == trues[task]).mean():.4f}")
-    print("Confusion matrix (rows=true, cols=pred):")
-    print(CLASSES)
-    print(confusion_matrix(trues, preds, labels=list(range(len(CLASSES)))))
+    print("[ANN] Confusion matrix (rows=true, cols=pred):")
+    print(classes)
+    print(confusion_matrix(trues, preds, labels=list(range(len(classes)))))
+
+    if args.no_snn:
+        if save_path:
+            save_now()
+        return
+
+    # ---------------------------------------------------------------------
+    # Convert the per-view CNNs to spiking networks and re-run the test set.
+    # The trained weights are used exactly as they are -- the only thing
+    # calibration measures is how large each ReLU's activations get, which
+    # is what sets its IF neuron's threshold.
+    # ---------------------------------------------------------------------
+    n_enc = len(model.chunk_encoder.encoders)
+    print(f"\nConverting {n_enc} view CNN{'s' if n_enc != 1 else ''} "
+          f"({len(VIEW_NAMES)} views, sensorimotor "
+          f"{'tied' if not args.no_tie_sm else 'independent'}) to spiking networks.")
+    print(f"Calibrating IF thresholds on {args.calib_batches} unaugmented "
+          f"training batches (percentile={args.calib_percentile})...")
+    # Calibration wants clean, representative activations, so it gets its own
+    # unaugmented loader over the training runs.
+    thresholds = calibrate_thresholds(model, loader(tr_idx, True), device,
+                                      args.calib_batches, args.calib_percentile)
+    for key, th in thresholds.items():
+        print(f"  {key:>19}: act1={th['act1']:.4f}  act2={th['act2']:.4f}")
+
+    checkpoints = sorted({min(int(t), args.timesteps)
+                          for t in args.timestep_checkpoints.split(",")}
+                         | {args.timesteps})
+    if args.snn_limit_batches:
+        print(f"NOTE: SNN evaluated on the first {args.snn_limit_batches} test "
+              f"batches only (--snn-limit-batches)")
+    print(f"\nSimulating the hybrid (spiking view CNNs -> ANN attention) "
+          f"up to T={args.timesteps}:")
+    hybrid = HybridSNNModel(model, thresholds, chunk_batch=args.snn_chunk_batch)
+    acc_by_t, snn_trues, snn_preds, ann_preds, spike_rates = evaluate_hybrid(
+        hybrid, test_loader, device, args.timesteps, checkpoints,
+        limit_batches=args.snn_limit_batches)
+
+    t_max = max(checkpoints)
+    print(f"\n[SNN, T={t_max}] Classification report (test set):")
+    print(classification_report(snn_trues, snn_preds,
+                                labels=list(range(len(classes))),
+                                target_names=classes, digits=3, zero_division=0))
+    snn_task = (snn_trues != classes.index("baseline")) if "baseline" in classes else np.zeros(0, bool)
+    if snn_task.any():
+        print(f"[SNN, T={t_max}] Task-only accuracy (baseline chunks excluded): "
+              f"{(snn_preds[snn_task] == snn_trues[snn_task]).mean():.4f}")
+    print(f"[SNN, T={t_max}] Confusion matrix (rows=true, cols=pred):")
+    print(classes)
+    print(confusion_matrix(snn_trues, snn_preds,
+                           labels=list(range(len(classes)))))
+
+    print("\n=== ANN vs hybrid SNN (same test chunks) ===")
+    print(f"ANN view CNNs:            test_acc={(ann_preds == snn_trues).mean():.4f}")
+    for t in checkpoints:
+        print(f"Spiking view CNNs (T={t:>4}): test_acc={acc_by_t[t]:.4f}")
+    agree = (snn_preds == ann_preds).mean()
+    print(f"Prediction agreement with the ANN at T={t_max}: {agree:.4f}  "
+          f"(1.0 would be a lossless conversion)")
+    print(f"\n[SNN] Mean spike rate per view CNN layer at T={args.timesteps} "
+          f"(fraction of neuron-timesteps that fired; lower is sparser and "
+          f"cheaper on spiking hardware):")
+    for key in sorted(spike_rates):
+        print(f"  {key:>26}: {spike_rates[key]:.4f}")
+
+    if save_path:
+        save_now(thresholds=thresholds)
 
 
 if __name__ == "__main__":

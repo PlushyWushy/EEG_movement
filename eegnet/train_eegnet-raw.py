@@ -119,7 +119,7 @@ class EEGNet(nn.Module):
 
     def __init__(self, n_classes, chans, samples,
                  dropout_rate=0.5, kernel_length=64,
-                 F1=8, D=2, F2=None, norm_rate=0.25,
+                 F1=8, D=2, F2=None, d_model=None, norm_rate=0.25,
                  dropout_type="Dropout"):
         super().__init__()
         F2 = F2 or F1 * D
@@ -151,7 +151,12 @@ class EEGNet(nn.Module):
         self.drop2 = DropoutCls(dropout_rate)
 
         flat_samples = samples // 4 // 8
-        self.classifier = nn.Linear(F2 * flat_samples, n_classes)
+        flat_features = F2 * flat_samples
+        # Optional bottleneck between the conv stack and the classifier,
+        # mirroring ViewEncoder's chunk-token projection (transformer/*/
+        # train_multiview_transformer.py) -- see train_eegnet.py for why.
+        self.proj = nn.Linear(flat_features, d_model) if d_model else None
+        self.classifier = nn.Linear(d_model if d_model else flat_features, n_classes)
 
     def forward(self, x):
         x = x.unsqueeze(1)
@@ -172,6 +177,8 @@ class EEGNet(nn.Module):
         x = self.drop2(x)
 
         x = x.flatten(1)
+        if self.proj is not None:
+            x = self.proj(x)
         return self.classifier(x)
 
     @torch.no_grad()
@@ -196,6 +203,12 @@ def main():
     ap.add_argument("--f1", type=int, default=8, help="Temporal filters (paper default: 8)")
     ap.add_argument("--d", type=int, default=2, help="Spatial filters per temporal filter (paper default: 2)")
     ap.add_argument("--f2", type=int, default=None, help="Pointwise filters (default: F1*D)")
+    ap.add_argument("--d-model", type=int, default=128,
+                     help="Bottleneck Linear(flat_features -> d_model) inserted before the "
+                          "classifier, mirroring ViewEncoder's chunk-token projection in the "
+                          "transformer scripts -- the lever for matching EEGNet's parameter count "
+                          "against theirs. 0 disables it: classify directly off the flattened "
+                          "conv features, the original paper's design.")
     ap.add_argument("--kernel-length", type=int, default=80,
                      help="Temporal kernel length (paper rule: half the sampling rate; "
                           "160Hz here -> 80, vs. their 128Hz -> 64)")
@@ -280,8 +293,8 @@ def main():
     n_channels, n_times = X_train.shape[1], X_train.shape[2]
     model = EEGNet(len(CLASSES), n_channels, n_times,
                    dropout_rate=args.dropout, kernel_length=args.kernel_length,
-                   F1=args.f1, D=args.d, F2=args.f2, norm_rate=args.norm_rate,
-                   dropout_type=args.dropout_type).to(device)
+                   F1=args.f1, D=args.d, F2=args.f2, d_model=args.d_model or None,
+                   norm_rate=args.norm_rate, dropout_type=args.dropout_type).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 

@@ -1,6 +1,6 @@
 
 """
-SNN multiview
+SNN multiview, spiking attention
 """
 import argparse
 import sys
@@ -9,13 +9,17 @@ from pathlib import Path
 
 import mne
 import numpy as np
+import snntorch as snn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from snntorch import surrogate
+from snntorch import utils as snn_utils
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.neighbors import NearestNeighbors
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 from mlp.train_mlp import (
     CLASS_TO_IDX,
     CLASSES,
@@ -27,7 +31,7 @@ from mlp.train_mlp import (
     subject_dirs,
 )
 
-CACHE_DIR = Path(__file__).parent.parent / ".cache"
+CACHE_DIR = ROOT / ".cache"
 
 # The 64 channels as they appear in the EDFs (trailing dots stripped), in a
 # fixed canonical order so view indices below are stable constants.
@@ -588,6 +592,19 @@ def make_pad_mask(lengths, T, device):
     return ar >= lengths.unsqueeze(1).to(device)
 
 
+def save_checkpoint(path, **payload):
+    """torch.save wrapper shared by every --save handler here: creates the
+    parent dir and confirms what was written, so a bare state_dict is never
+    saved alone -- callers also bundle the constructor config, the calibrated
+    thresholds/token scales, and (for the spiking model) its own config,
+    since the frozen front end isn't an nn.Module and would otherwise be
+    invisible to state_dict() entirely."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+    print(f"Saved checkpoint to {path}  (keys: {', '.join(sorted(payload))})")
+
+
 def run_epoch(model, loader, criterion, optimizer, device, train):
     model.train(train)
     total_loss, correct, n = 0.0, 0, 0
@@ -791,21 +808,37 @@ class SpikingViewEncoder:
         return spk, mem - spk * threshold
 
     @torch.no_grad()
+    def start(self, x):
+        """Membrane state for one view's chunks. The temporal->spatial run is
+        linear and the analog input is constant, so its output current is
+        computed once here rather than at every timestep."""
+        cur1 = self.pre(x.unsqueeze(1))
+        return {"cur1": cur1, "mem1": torch.zeros_like(cur1), "mem2": None}
+
+    @torch.no_grad()
+    def step(self, state):
+        """Advance one timestep. Returns the projection's input current --
+        the raw ANN-scale token, before any rate decoding or token
+        normalisation -- and both layers' spike tensors.
+
+        Stepwise rather than a self-contained loop because the spiking
+        transformer above has to be advanced in lockstep with this."""
+        spk1, state["mem1"] = self._if_step(state["cur1"], state["mem1"], self.thr1)
+        cur2 = self.mid(self.pool1(spk1 * self.thr1))
+        if state["mem2"] is None:
+            state["mem2"] = torch.zeros_like(cur2)
+        spk2, state["mem2"] = self._if_step(cur2, state["mem2"], self.thr2)
+        return self.proj(self.pool2(spk2 * self.thr2).flatten(1)), spk1, spk2
+
+    @torch.no_grad()
     def run(self, x, timesteps, checkpoints):
         """x: (N, C_view, 640) -> ({t: (N, d_model)}, mean spike rates)."""
-        cur1 = self.pre(x.unsqueeze(1))     # constant across timesteps
-        mem1, mem2, acc = torch.zeros_like(cur1), None, None
+        state, acc = self.start(x), None
         spike_sums = {a: 0.0 for a in ACT_LAYERS}
         emb_by_t = {}
 
         for t in range(1, timesteps + 1):
-            spk1, mem1 = self._if_step(cur1, mem1, self.thr1)
-            cur2 = self.mid(self.pool1(spk1 * self.thr1))
-            if mem2 is None:
-                mem2 = torch.zeros_like(cur2)
-            spk2, mem2 = self._if_step(cur2, mem2, self.thr2)
-
-            emb = self.proj(self.pool2(spk2 * self.thr2).flatten(1))
+            emb, spk1, spk2 = self.step(state)
             acc = emb if acc is None else acc + emb
             spike_sums["act1"] += spk1.mean().item()
             spike_sums["act2"] += spk2.mean().item()
@@ -942,7 +975,455 @@ def evaluate_hybrid(hybrid, loader, device, timesteps, checkpoints,
             np.concatenate(ann_preds), spike_rates)
 
 
-def main():
+def hybrid_report(model, test_loader, device, args, thresholds, checkpoints):
+    """The intermediate baseline: converted CNNs still feeding ANN attention.
+    Reported at the same T the spiking model runs at, so the three numbers in
+    the summary differ only in what replaced what."""
+    if args.snn_limit_batches:
+        print(f"NOTE: SNN evaluated on the first {args.snn_limit_batches} test "
+              f"batches only (--snn-limit-batches)")
+    print(f"\nSimulating the hybrid (spiking view CNNs -> ANN attention) "
+          f"up to T={args.timesteps}:")
+    hybrid = HybridSNNModel(model, thresholds, chunk_batch=args.snn_chunk_batch)
+    acc_by_t, snn_trues, snn_preds, ann_preds, spike_rates = evaluate_hybrid(
+        hybrid, test_loader, device, args.timesteps, checkpoints,
+        limit_batches=args.snn_limit_batches)
+
+    t_max = max(checkpoints)
+    print(f"\n[SNN, T={t_max}] Classification report (test set):")
+    print(classification_report(snn_trues, snn_preds,
+                                labels=list(range(len(CLASSES))),
+                                target_names=CLASSES, digits=3, zero_division=0))
+    snn_task = snn_trues != CLASS_TO_IDX["baseline"]
+    if snn_task.any():
+        print(f"[SNN, T={t_max}] Task-only accuracy (baseline chunks excluded): "
+              f"{(snn_preds[snn_task] == snn_trues[snn_task]).mean():.4f}")
+    print(f"[SNN, T={t_max}] Confusion matrix (rows=true, cols=pred):")
+    print(CLASSES)
+    print(confusion_matrix(snn_trues, snn_preds,
+                           labels=list(range(len(CLASSES)))))
+
+    print("\n=== ANN vs hybrid SNN (same test chunks) ===")
+    print(f"ANN view CNNs:            test_acc={(ann_preds == snn_trues).mean():.4f}")
+    for t in checkpoints:
+        print(f"Spiking view CNNs (T={t:>4}): test_acc={acc_by_t[t]:.4f}")
+    agree = (snn_preds == ann_preds).mean()
+    print(f"Prediction agreement with the ANN at T={t_max}: {agree:.4f}  "
+          f"(1.0 would be a lossless conversion)")
+    print(f"\n[SNN] Mean spike rate per view CNN layer at T={args.timesteps} "
+          f"(fraction of neuron-timesteps that fired; lower is sparser and "
+          f"cheaper on spiking hardware):")
+    for key in sorted(spike_rates):
+        print(f"  {key:>26}: {spike_rates[key]:.4f}")
+
+
+# --------------------------------------------------------------------------
+# Spikformer-style spiking attention on top of the frozen spiking CNNs
+# --------------------------------------------------------------------------
+
+@torch.no_grad()
+def calibrate_token_scales(model, loader, device, n_batches, percentile):
+    """A per-encoder gain for the frozen projection's output.
+
+    ViewEncoder.proj has no activation after it, so its output is signed and
+    O(1)-ish -- feed it straight to a threshold-1 neuron and the firing rate
+    depends entirely on how large that particular encoder happens to have
+    grown. Dividing by a high percentile of its own output puts every view
+    in the same, usable firing regime at the start of phase 2. It is a
+    constant gain, so like the spike scaling it folds into the downstream
+    Q/K/V weights on hardware, and phase 2 is free to absorb it anyway.
+
+    Calibrated, not trained: no gradient ever reaches the CNN.
+    """
+    model.eval()
+    chunk_enc = model.chunk_encoder
+    scales = {k: 0.0 for k in chunk_enc.encoders}
+
+    def make_hook(key):
+        def hook(module, inp, out):
+            scales[key] = max(scales[key], robust_max(out, percentile))
+        return hook
+
+    handles = [enc.proj.register_forward_hook(make_hook(key))
+               for key, enc in chunk_enc.encoders.items()]
+    try:
+        for i, (xb, _, lb) in enumerate(loader):
+            if i >= n_batches:
+                break
+            xb = xb.to(device)
+            chunk_enc(xb[~make_pad_mask(lb, xb.shape[1], device)])
+    finally:
+        for h in handles:
+            h.remove()
+    return {k: max(v, 1e-4) for k, v in scales.items()}
+
+
+class SpikingViewFrontEnd:
+    """The five converted view CNNs, advanced one timestep at a time and
+    stopping at the projection -- the frozen base the spiking transformer
+    sits on.
+
+    Deliberately not an nn.Module: kept as a plain object, its convs and
+    projections never appear in the spiking model's .parameters(), so the
+    phase-2 optimizer cannot touch the CNN even by accident. It runs under
+    no_grad throughout, which is also why the hand-written IF neurons here
+    need no surrogate gradient -- only the layers above them do.
+    """
+
+    def __init__(self, chunk_encoder, thresholds, token_scales):
+        self.tie_sm = chunk_encoder.tie_sm
+        self.encoders = {key: SpikingViewEncoder(enc, thresholds[key])
+                         for key, enc in chunk_encoder.encoders.items()}
+        self.keys = [encoder_key(v, self.tie_sm) for v in VIEW_NAMES]
+        self.scales = [token_scales[k] for k in self.keys]
+
+    @torch.no_grad()
+    def start(self, x):
+        """x: (N, 64, 640) -> one IF state per view."""
+        return [self.encoders[k].start(
+                    x.index_select(1, torch.as_tensor(_view_idx[v], device=x.device)))
+                for v, k in zip(VIEW_NAMES, self.keys)]
+
+    @torch.no_grad()
+    def step(self, states, record=False):
+        """-> (N, n_views, d_model) token currents, and the per-view spike
+        rates only when asked: this runs at every timestep of every training
+        batch, and ten spare reductions there are not free."""
+        toks, rates = [], {}
+        for v, k, scale, state in zip(VIEW_NAMES, self.keys, self.scales, states):
+            cur, spk1, spk2 = self.encoders[k].step(state)
+            toks.append(cur / scale)
+            if record:
+                rates[f"{v}.act1"] = spk1.mean()
+                rates[f"{v}.act2"] = spk2.mean()
+        return torch.stack(toks, dim=1), rates
+
+
+def lif(beta, spike_grad, threshold=1.0):
+    """Leaky integrate-and-fire with a surrogate gradient. init_hidden keeps
+    the membrane inside the module: the stack below is deep enough that
+    threading every membrane through the call chain, as cnn-gru/train_snn.py
+    does, would drown the code. snn_utils.reset() clears them per batch."""
+    return snn.Leaky(beta=beta, threshold=threshold, spike_grad=spike_grad,
+                     init_hidden=True)
+
+
+class SpikingSelfAttention(nn.Module):
+    """Spikformer's SSA (Zhou et al., ICLR 2023).
+
+    Q, K and V are spike matrices -- Linear -> BatchNorm -> LIF -- so Q K^T
+    and (Q K^T) V are products of {0,1} matrices: accumulate-only, no
+    multiplications, which is the point of the design. There is no softmax
+    (a spike matrix has no negatives to normalise away, and exp() is exactly
+    what you cannot afford on spiking hardware); a scalar scale stands in for
+    it, and the result passes through its own LIF before the output
+    projection.
+
+    Masking is simpler here than in the ANN: with no softmax, a disallowed
+    position is zeroed rather than set to -inf.
+    """
+
+    def __init__(self, dim, heads, beta, spike_grad, scale=0.125,
+                 attn_threshold=0.5):
+        super().__init__()
+        assert dim % heads == 0, "d_model must divide evenly among SSA heads"
+        self.heads, self.head_dim = heads, dim // heads
+        # Learnable, unlike the paper's constant: the value that puts the
+        # attention neuron in range depends on how many tokens the stage
+        # attends over, and the two stages here differ by 6x. See
+        # calibrate_ssa_scales for where its starting value comes from.
+        self.scale = nn.Parameter(torch.tensor(float(scale)))
+        self.calibrating, self.calib_sum, self.calib_nonzero = False, 0.0, 0.0
+        self.q_lin, self.k_lin, self.v_lin = (
+            nn.Linear(dim, dim, bias=False) for _ in range(3))
+        self.q_bn, self.k_bn, self.v_bn = (nn.BatchNorm1d(dim) for _ in range(3))
+        self.q_lif, self.k_lif, self.v_lif = (
+            lif(beta, spike_grad) for _ in range(3))
+        # Paper's threshold for the attention neuron: Q K^T V sums over both
+        # the head dimension and the tokens, so it arrives much larger than a
+        # single synaptic current.
+        self.attn_lif = lif(beta, spike_grad, threshold=attn_threshold)
+        self.out_lin = nn.Linear(dim, dim, bias=False)
+        self.out_bn = nn.BatchNorm1d(dim)
+        self.out_lif = lif(beta, spike_grad)
+
+    @staticmethod
+    def _spike_proj(x, linear, bn, neuron):
+        # BatchNorm1d normalises per feature over (batch x tokens), so the
+        # token axis has to be last.
+        return neuron(bn(linear(x).transpose(1, 2)).transpose(1, 2))
+
+    def forward(self, x, mask=None):       # x: (N, L, D) spikes
+        N, L, D = x.shape
+        heads = lambda t: t.reshape(N, L, self.heads, self.head_dim).transpose(1, 2)
+        q = heads(self._spike_proj(x, self.q_lin, self.q_bn, self.q_lif))
+        k = heads(self._spike_proj(x, self.k_lin, self.k_bn, self.k_lif))
+        v = heads(self._spike_proj(x, self.v_lin, self.v_bn, self.v_lif))
+
+        attn = q @ k.transpose(-2, -1)     # (N, heads, L, L) spike coincidences
+        if mask is not None:
+            attn = attn.masked_fill(mask, 0.0)
+        raw = attn @ v
+        if self.calibrating:
+            self.calib_sum += float(raw.sum())
+            self.calib_nonzero += float((raw != 0).sum())
+        out = self.attn_lif((raw * self.scale).transpose(1, 2).reshape(N, L, D))
+        return self._spike_proj(out, self.out_lin, self.out_bn, self.out_lif)
+
+
+class SpikingMLP(nn.Module):
+    """The block's feedforward half, spiking: Linear -> BN -> LIF, twice.
+    Same 2x expansion the ANN TransformerEncoderLayer used."""
+
+    def __init__(self, dim, hidden, beta, spike_grad):
+        super().__init__()
+        self.fc1, self.bn1, self.lif1 = (nn.Linear(dim, hidden),
+                                         nn.BatchNorm1d(hidden),
+                                         lif(beta, spike_grad))
+        self.fc2, self.bn2, self.lif2 = (nn.Linear(hidden, dim),
+                                         nn.BatchNorm1d(dim),
+                                         lif(beta, spike_grad))
+
+    def forward(self, x):
+        h = self.lif1(self.bn1(self.fc1(x).transpose(1, 2)).transpose(1, 2))
+        return self.lif2(self.bn2(self.fc2(h).transpose(1, 2)).transpose(1, 2))
+
+
+class SpikformerBlock(nn.Module):
+    """SSA + MLP with residuals, replacing one nn.TransformerEncoderLayer.
+
+    The residuals add spike trains, so activations are small non-negative
+    integers rather than binary -- that is what the paper does, and the
+    BatchNorm at the head of each sub-block is what keeps it in range."""
+
+    def __init__(self, dim, heads, beta, spike_grad, scale, attn_threshold):
+        super().__init__()
+        self.attn = SpikingSelfAttention(dim, heads, beta, spike_grad,
+                                         scale=scale, attn_threshold=attn_threshold)
+        self.mlp = SpikingMLP(dim, 2 * dim, beta, spike_grad)
+
+    def forward(self, x, mask=None):
+        x = x + self.attn(x, mask)
+        return x + self.mlp(x)
+
+
+class SpikformerRunModel(nn.Module):
+    """MultiViewRunModel with both attention stages replaced by Spikformer
+    blocks, sitting on the frozen converted view CNNs.
+
+    The structure of the ANN is kept line for line -- per-view tokens plus
+    view embeddings, one fusion attention over the 5 views, a causal context
+    attention over the run, and the LayerNorm(local + gate * context)
+    combination -- so the only variable being changed is what kind of
+    attention does the work.
+
+    Three joins deserve comment:
+
+    * The frozen projection's output is a current, not a spike train, so a
+      LIF turns each view token into spikes before the fusion block. Its
+      input is (calibrated projection current + view embedding), which lets
+      the trainable view embedding act as the per-view bias that decides
+      where that neuron sits in its firing range.
+    * The local and context paths get separate input neurons off the same
+      fused current, because the ANN kept position information on the
+      context path only -- the local path, and therefore the
+      context_weight=0 ablation, stays position-free.
+    * The readout accumulates local + gate * context over the simulation and
+      normalises once at the end. That is Spikformer's mean-over-time
+      readout, and it keeps the trained ANN's head usable as a warm start.
+
+    Everything trainable here is initialised from the ANN where the shapes
+    line up (view embeddings, positions, context gate, norm, head); only the
+    spiking attention blocks start fresh.
+    """
+
+    def __init__(self, ann_model, thresholds, token_scales, timesteps,
+                 n_classes=len(CLASSES), heads=4, ctx_layers=2, dropout=0.3,
+                 max_len=64, beta=0.9, scale=0.125, attn_threshold=0.5,
+                 spike_grad=None):
+        super().__init__()
+        spike_grad = spike_grad or surrogate.fast_sigmoid()
+        self.front = SpikingViewFrontEnd(ann_model.chunk_encoder, thresholds,
+                                         token_scales)
+        self.timesteps = timesteps
+        self.context_len = ann_model.context_len
+        d = ann_model.pos.embedding_dim
+
+        self.view_emb = nn.Parameter(
+            ann_model.chunk_encoder.view_emb.detach().clone())
+        self.token_lif = lif(beta, spike_grad)
+        self.fuse = SpikformerBlock(d, heads, beta, spike_grad, scale, attn_threshold)
+
+        self.pos = nn.Embedding(max_len, d)
+        self.pos.weight.data.copy_(ann_model.pos.weight.detach())
+        self.local_lif = lif(beta, spike_grad)
+        self.ctx_lif = lif(beta, spike_grad)
+        self.context = nn.ModuleList([
+            SpikformerBlock(d, heads, beta, spike_grad, scale, attn_threshold)
+            for _ in range(ctx_layers)])
+
+        self.context_gate = nn.Parameter(ann_model.context_gate.detach().clone())
+        self.norm = nn.LayerNorm(d)
+        self.norm.load_state_dict(ann_model.norm.state_dict())
+        self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d, n_classes))
+        self.head.load_state_dict(ann_model.head.state_dict())
+
+        self.record_spikes = False
+        self.spike_rates = {}
+
+    def attn_mask(self, T, device, pad_mask):
+        """True = disallowed, as in MultiViewRunModel.attn_mask, broadcast
+        over heads and combined with the padding mask on the key axis."""
+        i = torch.arange(T, device=device).unsqueeze(1)
+        j = torch.arange(T, device=device).unsqueeze(0)
+        causal = j > i
+        if self.context_len > 0:
+            causal = causal | ((i - j) >= self.context_len)
+        return causal[None, None] | pad_mask[:, None, None, :]
+
+    def forward(self, x, pad_mask):
+        B, T = x.shape[:2]
+        d = self.view_emb.shape[1]
+        snn_utils.reset(self)
+
+        # Padded positions are never simulated -- they are zero-padding with
+        # no label, masked out of the context attention as keys. Their slots
+        # in the grid stay at zero, and each block re-zeroes them so nothing
+        # a BatchNorm sees drifts away from that.
+        keep = (~pad_mask).reshape(-1)
+        valid = (~pad_mask).unsqueeze(-1).float()
+        chunks = x.reshape(B * T, x.shape[2], x.shape[3])[keep]
+        states = self.front.start(chunks)
+        mask = self.attn_mask(T, x.device, pad_mask)
+        pos = self.pos(torch.arange(T, device=x.device)).unsqueeze(0)
+
+        feat, rate_sums = 0.0, {}
+        for _ in range(self.timesteps):
+            tok_cur, rates = self.front.step(states, self.record_spikes)
+            tok = self.token_lif(tok_cur + self.view_emb.unsqueeze(0))
+            fused = self.fuse(tok).mean(dim=1)                # (N, d) current
+
+            grid = torch.zeros(B * T, d, device=x.device, dtype=fused.dtype)
+            grid[keep] = fused
+            grid = grid.reshape(B, T, d)
+
+            local = self.local_lif(grid)                      # position-free
+            h = self.ctx_lif(grid + pos)                      # context path only
+            for block in self.context:
+                h = block(h, mask) * valid
+            feat = feat + local + self.context_gate * h
+
+            if self.record_spikes:
+                for k, v in rates.items():
+                    rate_sums[k] = rate_sums.get(k, 0.0) + v
+
+        if self.record_spikes:
+            self.spike_rates = {k: float(v / self.timesteps)
+                                for k, v in rate_sums.items()}
+        return self.head(self.norm(feat / self.timesteps))
+
+
+def load_model(path, device="cpu"):
+    """Reconstruct the trained spiking model saved via --save. Rebuilds the
+    ANN first (its weights are what the frozen, folded, IF-converted view
+    CNNs are deterministically derived from -- SpikingViewFrontEnd is not an
+    nn.Module, so its weights are never in spiking_state at all), then
+    restores the trained spiking attention weights on top. Returns
+    (spiking_model, classes)."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ann_model = MultiViewRunModel(**ckpt["ann_config"]).to(device)
+    ann_model.load_state_dict(ckpt["ann_state"])
+    spiking = SpikformerRunModel(
+        ann_model, ckpt["thresholds"], ckpt["token_scales"],
+        **ckpt["spiking_config"]).to(device)
+    spiking.load_state_dict(ckpt["spiking_state"])
+    spiking.eval()
+    return spiking, ckpt["classes"]
+
+
+@torch.no_grad()
+def calibrate_ssa_scales(spiking, loader, device, target=1.0):
+    """Put each attention neuron in range before phase 2 starts.
+
+    Spikformer's fixed 0.125 is sized for ImageNet-sized token counts: Q K^T V
+    sums over the head dimension and over L tokens, and at L=196 patches it
+    lands comfortably on a 0.5 threshold. The fusion stage here attends over
+    5 view tokens and the context stage over ~30 chunks, an order of
+    magnitude apart from each other and two from the paper -- left at 0.125
+    the attention neuron fires ~0.2% of the time and the block degenerates
+    into its residual branch, which is the one failure mode that would make
+    this whole comparison meaningless.
+
+    So one forward pass measures Q K^T V per stage and sets the scale so a
+    TYPICAL NONZERO entry charges the attention neuron to `target` times its
+    threshold in one step. The nonzero mean is the statistic that survives
+    here: Q K^T V is a matrix of spike coincidences, mostly exactly zero, so
+    its high percentiles are zero and its overall mean is small enough that
+    matching it would hand back a scale in the hundreds -- which would then
+    saturate the neuron on any coincidence at all. Anchoring on the events
+    that actually happen sizes every stage sensibly regardless of how many
+    tokens it attends over. From here the scale is a learned parameter.
+    """
+    attns = [(n, m) for n, m in spiking.named_modules()
+             if isinstance(m, SpikingSelfAttention)]
+    for _, m in attns:
+        m.calibrating, m.calib_sum, m.calib_nonzero = True, 0.0, 0.0
+
+    was_training = spiking.training
+    spiking.eval()
+    xb, _, lb = next(iter(loader))
+    xb, lb = xb.to(device), lb.to(device)
+    spiking(xb, make_pad_mask(lb, xb.shape[1], device))
+    spiking.train(was_training)
+
+    scales = {}
+    for name, m in attns:
+        m.calibrating = False
+        if m.calib_nonzero > 0.0:
+            m.scale.data.fill_(target * float(m.attn_lif.threshold)
+                               / (m.calib_sum / m.calib_nonzero))
+        else:
+            print(f"  WARNING: {name} saw no Q K^T coincidences at all during "
+                  f"calibration -- too few timesteps for the stack to warm up? "
+                  f"Leaving its scale at {float(m.scale):.4f}")
+        scales[name] = float(m.scale)
+
+    # Measure rather than assume: a second pass reports what the attention
+    # neurons actually do at these scales, before a single epoch is spent.
+    with SpikeMonitor(spiking) as monitor:
+        spiking(xb, make_pad_mask(lb, xb.shape[1], device))
+        rates = {n: r for n, r in monitor.rates().items() if n.endswith("attn_lif")}
+    return scales, rates
+
+
+class SpikeMonitor:
+    """Records the mean output of every LIF in the model -- i.e. the fraction
+    of neuron-timesteps that fired -- for the sparsity report."""
+
+    def __init__(self, model):
+        self.model = model
+        self.sums, self.counts, self.handles = {}, {}, []
+
+    def __enter__(self):
+        def make_hook(name):
+            def hook(module, inp, out):
+                self.sums[name] = self.sums.get(name, 0.0) + out.mean().item()
+                self.counts[name] = self.counts.get(name, 0) + 1
+            return hook
+        self.handles = [m.register_forward_hook(make_hook(n))
+                        for n, m in self.model.named_modules()
+                        if isinstance(m, snn.Leaky)]
+        return self
+
+    def __exit__(self, *exc):
+        for h in self.handles:
+            h.remove()
+
+    def rates(self):
+        return {n: self.sums[n] / self.counts[n] for n in sorted(self.sums)}
+
+
+def main(task_spec=None, split_spec=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--max-subjects", type=int, default=None)
@@ -1013,11 +1494,15 @@ def main():
     # ANN -> SNN conversion of the per-view CNNs (post-training, no retraining)
     ap.add_argument("--no-snn", action="store_true",
                     help="Stop after the ANN evaluation, skipping the conversion")
-    ap.add_argument("--timesteps", type=int, default=128,
-                    help="Longest SNN simulation length (rate-coding timesteps)")
-    ap.add_argument("--timestep-checkpoints", type=str, default="8,16,32,64,128",
-                    help="Comma-separated T values to report accuracy at "
-                         "(capped at --timesteps)")
+    ap.add_argument("--timesteps", type=int, default=32,
+                    help="SNN simulation length, shared by the converted CNNs and "
+                         "the spiking transformer. Lower than a pure conversion "
+                         "would want (rate coding converges as ~1/T) because "
+                         "phase 2 backpropagates through every timestep; "
+                         "Spikformer itself trains at T=4")
+    ap.add_argument("--timestep-checkpoints", type=str, default="4,8,16,32",
+                    help="Comma-separated T values to report the converted CNNs' "
+                         "accuracy at (capped at --timesteps)")
     ap.add_argument("--calib-batches", type=int, default=10,
                     help="Unaugmented training batches used for threshold calibration")
     ap.add_argument("--calib-percentile", type=float, default=99.9,
@@ -1030,6 +1515,36 @@ def main():
                     help="Evaluate the SNN on only the first N test batches "
                          "(0 = all). The ANN reference is recomputed on the same "
                          "chunks, so the comparison stays valid")
+    ap.add_argument("--no-hybrid-eval", action="store_true",
+                    help="Skip the converted-CNN + ANN-attention baseline and go "
+                         "straight to the spiking-attention model")
+    # Phase 2: Spikformer attention trained with surrogate gradients
+    ap.add_argument("--snn-epochs", type=int, default=None,
+                    help="Epochs of surrogate-gradient training for the spiking "
+                         "attention (default: same budget as --epochs)")
+    ap.add_argument("--snn-lr", type=float, default=1e-3)
+    ap.add_argument("--ssa-heads", type=int, default=4,
+                    help="Heads in both spiking attention stages")
+    ap.add_argument("--ssa-scale", type=float, default=0.125,
+                    help="Spikformer's scalar in place of softmax normalisation; "
+                         "only a fallback, calibrate_ssa_scales overwrites it")
+    ap.add_argument("--ssa-target", type=float, default=1.0,
+                    help="Calibrate each SSA scale so a typical nonzero Q K^T V "
+                         "charges its attention neuron to this multiple of the "
+                         "firing threshold in one timestep")
+    ap.add_argument("--attn-threshold", type=float, default=0.5,
+                    help="Firing threshold of the attention neuron (paper: 0.5)")
+    ap.add_argument("--lif-beta", type=float, default=0.9,
+                    help="Membrane decay of every trained LIF")
+    ap.add_argument("--token-percentile", type=float, default=99.0,
+                    help="Percentile of the frozen projection's output used as "
+                         "each view's token gain (see calibrate_token_scales)")
+    ap.add_argument("--save", nargs="?", const="", default=None, metavar="PATH",
+                    help="Save the trained spiking model to PATH at the end (bare "
+                         "--save picks checkpoints/<script>_<timestamp>.pt). Bundles "
+                         "the ANN's weights/config, the calibrated thresholds and "
+                         "token scales, and the spiking attention's weights/config "
+                         "together -- see load_model().")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1039,12 +1554,25 @@ def main():
     cache_path = CACHE_DIR / f"mv_seq_raw_{suffix}.npz"
     X, y, lengths, sids, runs = build_sequences(cache_path, args.max_subjects,
                                                 use_cache=not args.no_cache)
+    # Task hook. A variant script passes a spec that narrows the label problem
+    # (see transformer/leftright.py); None keeps the full 5-class task, so this
+    # script's own behaviour is unchanged.
+    classes = CLASSES
+    if task_spec is not None:
+        X, y, lengths, sids, runs = task_spec.filter(X, y, lengths, sids, runs)
+        classes = task_spec.classes
+        print(f"\nTask: {task_spec.name}  ->  classes={classes}")
     print(f"Sequences: X={X.shape} (n_runs, T_max, channels, times), "
           f"subjects={len(set(sids.tolist()))}")
-    counts = {c: int((y == i).sum()) for i, c in enumerate(CLASSES)}
+    counts = {c: int((y == i).sum()) for i, c in enumerate(classes)}
     print("Chunk counts:", counts)
 
-    if args.split_mode == "run-holdout":
+    # Split hook, same idea as the task hook: a variant or the master runner
+    # can hand over its own splitter (see transformer/splits.py). None keeps
+    # this script's own --split-mode behaviour.
+    if split_spec is not None:
+        tr_idx, va_idx, te_idx = split_spec(sids, runs, args.seed)
+    elif args.split_mode == "run-holdout":
         tr_idx, va_idx, te_idx = run_holdout_split(sids, runs, seed=args.seed)
     else:
         tr_idx, va_idx, te_idx = subject_holdout_split(sids, seed=args.seed)
@@ -1090,16 +1618,23 @@ def main():
                           else "cpu")
     print(f"Using device: {device}")
 
-    model = MultiViewRunModel(
+    ann_config = dict(
+        n_classes=len(classes),
         d_model=args.d_model, tie_sm=not args.no_tie_sm,
         ctx_layers=args.ctx_layers, ctx_heads=args.ctx_heads,
         dropout=args.dropout, max_len=X.shape[1],
         context_weight=args.context_weight,
         freeze_context=args.freeze_context_weight,
         context_len=args.context_len, f1=args.f1, depth=args.depth,
-    ).to(device)
+    )
+    model = MultiViewRunModel(**ann_config).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,} "
           f"(sensorimotor encoders {'tied' if not args.no_tie_sm else 'independent'})")
+
+    save_path = None
+    if args.save is not None:
+        save_path = args.save or str(ROOT / "checkpoints" /
+            f"{Path(__file__).stem}_{time.strftime('%Y%m%d-%H%M%S')}.pt")
 
     if args.pretrain_epochs > 0:
         print(f"\nCausal masked-chunk pre-training on {len(tr_idx)} training runs "
@@ -1111,11 +1646,11 @@ def main():
         weight = None
     else:
         train_y = y[tr_idx]
-        freq = np.array([max((train_y == i).sum(), 1) for i in range(len(CLASSES))],
+        freq = np.array([max((train_y == i).sum(), 1) for i in range(len(classes))],
                         dtype=np.float64)
-        weight = torch.tensor((freq.sum() / (len(CLASSES) * freq)),
+        weight = torch.tensor((freq.sum() / (len(classes) * freq)),
                               dtype=torch.float32, device=device)
-        print("Class weights:", {c: round(float(w), 3) for c, w in zip(CLASSES, weight)})
+        print("Class weights:", {c: round(float(w), 3) for c, w in zip(classes, weight)})
 
     criterion = nn.CrossEntropyLoss(weight=weight, ignore_index=-1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
@@ -1158,15 +1693,15 @@ def main():
     preds, trues = np.concatenate(preds), np.concatenate(trues)
 
     print("\n[ANN] Classification report (test set):")
-    print(classification_report(trues, preds, labels=list(range(len(CLASSES))),
-                                target_names=CLASSES, digits=3, zero_division=0))
-    task = trues != CLASS_TO_IDX["baseline"]
+    print(classification_report(trues, preds, labels=list(range(len(classes))),
+                                target_names=classes, digits=3, zero_division=0))
+    task = (trues != classes.index("baseline")) if "baseline" in classes else np.zeros(0, bool)
     if task.any():
         print(f"[ANN] Task-only accuracy (baseline chunks excluded): "
               f"{(preds[task] == trues[task]).mean():.4f}")
     print("[ANN] Confusion matrix (rows=true, cols=pred):")
-    print(CLASSES)
-    print(confusion_matrix(trues, preds, labels=list(range(len(CLASSES)))))
+    print(classes)
+    print(confusion_matrix(trues, preds, labels=list(range(len(classes)))))
 
     if args.no_snn:
         return
@@ -1193,42 +1728,128 @@ def main():
     checkpoints = sorted({min(int(t), args.timesteps)
                           for t in args.timestep_checkpoints.split(",")}
                          | {args.timesteps})
-    if args.snn_limit_batches:
-        print(f"NOTE: SNN evaluated on the first {args.snn_limit_batches} test "
-              f"batches only (--snn-limit-batches)")
-    print(f"\nSimulating the hybrid (spiking view CNNs -> ANN attention) "
-          f"up to T={args.timesteps}:")
-    hybrid = HybridSNNModel(model, thresholds, chunk_batch=args.snn_chunk_batch)
-    acc_by_t, snn_trues, snn_preds, ann_preds, spike_rates = evaluate_hybrid(
-        hybrid, test_loader, device, args.timesteps, checkpoints,
-        limit_batches=args.snn_limit_batches)
+    if not args.no_hybrid_eval:
+        hybrid_report(model, test_loader, device, args, thresholds, checkpoints)
 
-    t_max = max(checkpoints)
-    print(f"\n[SNN, T={t_max}] Classification report (test set):")
-    print(classification_report(snn_trues, snn_preds,
-                                labels=list(range(len(CLASSES))),
-                                target_names=CLASSES, digits=3, zero_division=0))
-    snn_task = snn_trues != CLASS_TO_IDX["baseline"]
-    if snn_task.any():
-        print(f"[SNN, T={t_max}] Task-only accuracy (baseline chunks excluded): "
-              f"{(snn_preds[snn_task] == snn_trues[snn_task]).mean():.4f}")
-    print(f"[SNN, T={t_max}] Confusion matrix (rows=true, cols=pred):")
-    print(CLASSES)
-    print(confusion_matrix(snn_trues, snn_preds,
-                           labels=list(range(len(CLASSES)))))
+    # ---------------------------------------------------------------------
+    # Phase 2: replace both attention stages with Spikformer blocks and
+    # train them with surrogate gradients, the CNNs frozen.
+    # ---------------------------------------------------------------------
+    token_scales = calibrate_token_scales(model, loader(tr_idx, True), device,
+                                          args.calib_batches, args.token_percentile)
+    print("\nToken gains (percentile of each frozen projection's output):",
+          {k: round(v, 3) for k, v in token_scales.items()})
 
-    print("\n=== ANN vs hybrid SNN (same test chunks) ===")
-    print(f"ANN view CNNs:            test_acc={(ann_preds == snn_trues).mean():.4f}")
-    for t in checkpoints:
-        print(f"Spiking view CNNs (T={t:>4}): test_acc={acc_by_t[t]:.4f}")
-    agree = (snn_preds == ann_preds).mean()
-    print(f"Prediction agreement with the ANN at T={t_max}: {agree:.4f}  "
-          f"(1.0 would be a lossless conversion)")
-    print(f"\n[SNN] Mean spike rate per view CNN layer at T={args.timesteps} "
-          f"(fraction of neuron-timesteps that fired; lower is sparser and "
-          f"cheaper on spiking hardware):")
-    for key in sorted(spike_rates):
-        print(f"  {key:>26}: {spike_rates[key]:.4f}")
+    spiking_config = dict(
+        timesteps=args.timesteps, n_classes=len(classes), heads=args.ssa_heads,
+        ctx_layers=args.ctx_layers, dropout=args.dropout, max_len=X.shape[1],
+        beta=args.lif_beta, scale=args.ssa_scale, attn_threshold=args.attn_threshold)
+    spiking = SpikformerRunModel(
+        model, thresholds, token_scales, **spiking_config).to(device)
+
+    frozen = sum(p.numel() for p in model.chunk_encoder.encoders.parameters())
+    trainable = sum(p.numel() for p in spiking.parameters() if p.requires_grad)
+    print(f"Spiking model: {trainable:,} trainable attention parameters, "
+          f"{frozen:,} frozen CNN parameters "
+          f"(the front end is not an nn.Module, so it cannot reach the optimizer)")
+
+    ssa_scales, ssa_rates = calibrate_ssa_scales(spiking, train_loader, device,
+                                                 target=args.ssa_target)
+    print("SSA scales (a typical Q K^T V coincidence charges the attention "
+          f"neuron to {args.ssa_target:.2f}x threshold), and the firing rate "
+          "each one produces at initialisation:")
+    for name, s in ssa_scales.items():
+        rate = ssa_rates.get(f"{name}.attn_lif", float("nan"))
+        print(f"  {name:>22}: scale={s:<10.4f} attn_lif fires {rate:.4f}")
+
+    # Snapshot the CNN so the freeze is something the run demonstrates rather
+    # than something this script claims.
+    cnn_snapshot = {n: q.detach().clone()
+                    for n, q in model.chunk_encoder.encoders.named_parameters()}
+
+    snn_epochs = args.epochs if args.snn_epochs is None else args.snn_epochs
+    print(f"\nTraining Spikformer attention with surrogate gradients "
+          f"(fast sigmoid, beta={args.lif_beta}, T={args.timesteps}) for "
+          f"{snn_epochs} epochs:")
+    snn_opt = torch.optim.AdamW(spiking.parameters(), lr=args.snn_lr,
+                                weight_decay=args.weight_decay)
+    best_val, best_snn_state, stale = float("inf"), None, 0
+    for epoch in range(1, snn_epochs + 1):
+        t0 = time.time()
+        tr_loss, tr_acc = run_epoch(spiking, train_loader, criterion, snn_opt,
+                                    device, True)
+        va_loss, va_acc = run_epoch(spiking, val_loader, criterion, snn_opt,
+                                    device, False)
+        print(f"snn epoch {epoch:3d}  train_loss={tr_loss:.4f} train_acc={tr_acc:.4f}  "
+              f"val_loss={va_loss:.4f} val_acc={va_acc:.4f}  "
+              f"gate={spiking.context_gate.item():.3f}  ({time.time() - t0:.0f}s)",
+              flush=True)
+        if va_loss < best_val - 1e-4:
+            best_val, stale = va_loss, 0
+            best_snn_state = {k: v.clone() for k, v in spiking.state_dict().items()}
+        else:
+            stale += 1
+            if stale >= args.patience:
+                print(f"Early stopping at epoch {epoch} "
+                      f"(no val improvement for {args.patience} epochs)")
+                break
+    if best_snn_state is not None:
+        spiking.load_state_dict(best_snn_state)
+
+    drift = max((cnn_snapshot[n] - q).abs().max().item()
+                for n, q in model.chunk_encoder.encoders.named_parameters())
+    print(f"Frozen-CNN check: largest weight change across phase 2 = {drift:.2e}")
+
+    snn_loss, snn_acc = run_epoch(spiking, test_loader, criterion, snn_opt,
+                                  device, False)
+    print(f"\n[Spiking] Test loss={snn_loss:.4f}  Test accuracy={snn_acc:.4f}")
+    print(f"[Spiking] Learned context gate: {spiking.context_gate.item():.4f}")
+
+    spiking.eval()
+    spiking.record_spikes = True
+    sp_preds, sp_trues = [], []
+    with SpikeMonitor(spiking) as monitor, torch.no_grad():
+        for xb, yb, lb in test_loader:
+            xb, lb = xb.to(device), lb.to(device)
+            logits = spiking(xb, make_pad_mask(lb, xb.shape[1], device))
+            valid = yb.reshape(-1) != -1
+            sp_preds.append(
+                logits.reshape(-1, logits.shape[-1]).argmax(1).cpu()[valid].numpy())
+            sp_trues.append(yb.reshape(-1)[valid].numpy())
+        lif_rates = monitor.rates()
+    sp_preds, sp_trues = np.concatenate(sp_preds), np.concatenate(sp_trues)
+
+    print("\n[Spiking] Classification report (test set):")
+    print(classification_report(sp_trues, sp_preds, labels=list(range(len(classes))),
+                                target_names=classes, digits=3, zero_division=0))
+    sp_task = (sp_trues != classes.index("baseline")) if "baseline" in classes else np.zeros(0, bool)
+    if sp_task.any():
+        print(f"[Spiking] Task-only accuracy (baseline chunks excluded): "
+              f"{(sp_preds[sp_task] == sp_trues[sp_task]).mean():.4f}")
+    print("[Spiking] Confusion matrix (rows=true, cols=pred):")
+    print(classes)
+    print(confusion_matrix(sp_trues, sp_preds, labels=list(range(len(classes)))))
+
+    print("\n=== ANN attention vs spiking attention (full test set, "
+          f"T={args.timesteps}) ===")
+    print(f"ANN throughout:                        test_acc={test_acc:.4f}  "
+          f"({args.epochs} epoch budget)")
+    print(f"Spiking CNNs + Spikformer attention:   test_acc={snn_acc:.4f}  "
+          f"(+{snn_epochs} more on frozen CNNs)")
+    print("These budgets are not equal -- phase 2 trains on top of phase 1, so "
+          "the spiking model has seen the training set for longer, and freezing "
+          "the CNN to retrain the head is itself a regulariser. Read the gap as "
+          "'spiking attention can carry this task', not as a like-for-like win.")
+    print(f"\n[Spiking] Mean spike rate per layer (fraction of neuron-timesteps "
+          f"that fired; lower is sparser and cheaper on spiking hardware):")
+    for key, rate in {**spiking.spike_rates, **lif_rates}.items():
+        print(f"  {key:>28}: {rate:.4f}")
+
+    if save_path:
+        save_checkpoint(save_path, ann_state=model.state_dict(), ann_config=ann_config,
+                        thresholds=thresholds, token_scales=token_scales,
+                        spiking_state=spiking.state_dict(), spiking_config=spiking_config,
+                        classes=classes)
 
 
 if __name__ == "__main__":
