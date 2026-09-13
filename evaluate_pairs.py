@@ -185,16 +185,64 @@ def evaluate(subject_list, checkpoint_path, device="cpu"):
     print(f"  Genuine cross-trial context:            {remaining_attention:.2f} percentage points (~{remaining_attention/3.94*100:.1f}%)")
     print(f"{'=' * 72}")
 
+    return {
+        "overall_acc": p_overall,
+        "paired_acc": p_paired,
+        "t1_acc": t1_acc_total,
+        "t2_acc": t2_acc_total,
+        "asymmetry": asymmetry_total,
+        "both_wrong_obs": obs_both_wrong,
+        "both_wrong_exp": exp_both_wrong,
+        "one_wrong_obs": obs_one_wrong,
+        "one_wrong_exp": exp_one_wrong,
+    }
+
 
 def main():
+    import re
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--split", choices=["test13", "test10", "35"], default="test13",
                         help="Subject split: test13 (default: 13 held-out test subjects), "
                              "test10 (10 held-out test subjects), or 35 (S001-S035)")
     parser.add_argument("--checkpoint", default=None,
                         help="Path to checkpoint .pt file (default: newest in checkpoints/)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed used for subject split (default: auto-detected from checkpoint filename, else 42)")
+    parser.add_argument("--all-seeds", action="store_true",
+                        help="Evaluate all three checkpoints (seed42, seed43, seed44) on their respective test sets")
     parser.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
     args = parser.parse_args()
+
+    if args.all_seeds:
+        seeds = [42, 43, 44]
+        results = {}
+        for s in seeds:
+            ckpt_path = ROOT / "checkpoints" / f"seed{s}rhlh.pt"
+            if not ckpt_path.exists():
+                candidates = list((ROOT / "checkpoints").glob(f"*seed{s}*.pt"))
+                ckpt_path = candidates[0] if candidates else None
+            if ckpt_path is None or not ckpt_path.exists():
+                print(f"Warning: Checkpoint for seed {s} not found, skipping.")
+                continue
+            subs = get_test_subjects(n_val=0, seed=s)
+            print(f"\n>>> RUNNING SEED {s} on its held-out test subjects (seed={s}) <<<")
+            results[s] = evaluate(subs, ckpt_path, device=args.device)
+
+        print("\n" + "#" * 72)
+        print("SUMMARY ACROSS ALL 3 SEEDS (ON THEIR RESPECTIVE HELD-OUT TEST SUBJECTS):")
+        print("#" * 72)
+        print(f"{'Seed':<8} {'Overall Acc':<16} {'T1 Acc (Unconstrained)':<24} {'T2 Acc (Constrained)':<22} {'Asymmetry'}")
+        print("-" * 72)
+        for s, res in results.items():
+            print(f"Seed {s:<3} {res['overall_acc']*100:>6.2f}%          {res['t1_acc']*100:>6.2f}%                  {res['t2_acc']*100:>6.2f}%                 {res['asymmetry']:>+5.2f} pts")
+        print("-" * 72)
+        avg_overall = np.mean([r["overall_acc"] for r in results.values()]) * 100
+        avg_t1 = np.mean([r["t1_acc"] for r in results.values()]) * 100
+        avg_t2 = np.mean([r["t2_acc"] for r in results.values()]) * 100
+        avg_asym = np.mean([r["asymmetry"] for r in results.values()])
+        print(f"{'Mean':<8} {avg_overall:>6.2f}%          {avg_t1:>6.2f}%                  {avg_t2:>6.2f}%                 {avg_asym:>+5.2f} pts")
+        print("#" * 72)
+        return
 
     ckpt = args.checkpoint
     if ckpt is None:
@@ -205,10 +253,19 @@ def main():
     else:
         ckpt = Path(ckpt)
 
+    # Auto-detect seed from filename if not specified
+    if args.seed is not None:
+        seed = args.seed
+    else:
+        m = re.search(r"seed(\d+)", ckpt.name, re.IGNORECASE)
+        seed = int(m.group(1)) if m else 42
+
+    print(f"Using split seed = {seed} for checkpoint {ckpt.name}")
+
     if args.split == "test13":
-        subs = get_test_subjects(n_val=0, seed=42)
+        subs = get_test_subjects(n_val=0, seed=seed)
     elif args.split == "test10":
-        subs = get_test_subjects(n_val=3, seed=42)
+        subs = get_test_subjects(n_val=3, seed=seed)
     elif args.split == "35":
         subs = list(range(1, 36))
 

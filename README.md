@@ -96,6 +96,7 @@ What you would do next with more time and more compute.
 
 6. Local learning for deployment? This one is still just a hypothesis, but perhaps, when actually deployed on a neuromorphic chip, the network can engage in a sort of life-long learning to personalize itself to the user. Backprop isn't very good for neuromorphic chips, so we'd use local learning methods like STDP. 
 
+7. Figuring out locations. I'd ablate the model to see which area of EEG contributed most to this accuracy, and what part is most important in this decoding process.
 
 AI use.  
 

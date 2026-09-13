@@ -1,5 +1,5 @@
 Accuracies:
-singleview spikformer (lh vs rh imagined, 90:13 split):
+singleview spikformer (lh vs rh imagined, 90:13 split, initial test accuracy):
 Seed 42 Test accuracy = 0.8816
 Seed 43 Test accuracy = 0.9128
 Seed 44 Test accuracy = 0.8818
@@ -29,8 +29,20 @@ Seed 44 Test accuracy = 0.8271
 
 Average = 0.8413
 
-It was also found that the data in every chunk of 15 classes are paired; all the labels on the even indices are opposite to the label before it. Thus, further evaluation on the SNN model checkpoint was conducted.
-Over the 13 held-out test subjects, it scored 89.57% overall. Considering only the first-of-pair labels, it scored 88.64%, still beating all of the no-attention ablation runs, meaning that attention still provides a significant boost despite the pairing phenomenon.
+It was also found that the data in every chunk of 15 classes are paired; all the labels on the even indices are opposite to the label before it. Thus, further evaluation on the SNN model checkpoints was conducted.
+Over the 13 held-out test subjects, it scored 88.89% average. Considering only the first-of-pair labels, it scored 88.03%, still beating all of the no-attention ablation runs, meaning that attention still provides a significant boost despite the pairing phenomenon.
+
+seed 42 overall evaluation: 89.57%
+seed 43 overall evaluation: 89.74%
+seed 44 overall evaluation: 87.35%
+
+Average = 88.89%
+
+seed 42 only first-of-pair: 88.64%
+seed 43 only first-of-pair: 87.91%
+seed 44 only first-of-pair: 87.55%
+
+Average = 88.03%
 
 cnn-gru (1 seed, 42): 
 With preprocessing, Test accuracy=0.7581
