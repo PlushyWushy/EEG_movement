@@ -86,7 +86,7 @@ Future work:
 
 7. Figuring out locations. I'd ablate the model to see which area of EEG contributed most to this accuracy, and what part is most important in this decoding process.
 
-AI use.  
+AI use and inspiration  
 
 Claude code was used to assist in coding this project. My decision to move to a transformer was fueled both by the cross-interval interference and my past experience in EEG. In the litreview folder, there is a paper named eeg2text. This paper was one of my first exposures to EEG. I spent a few months my junior year trying to implement a multiview transformer to analyze text. Although it didn't work out as well as I'd hoped, I took my experience with EEG to text decoding to this project. 
 
