@@ -67,3 +67,10 @@ Full run, 90:13 split:
 43 Test accuracy=0.6709
 44 Test accuracy=0.6610
 
+Full run (all 4 classes), individual split, intra chunk attention:
+
+42 Test accuracy=0.7461
+43 Test accuracy=0.7313
+44 Test accuracy=0.7510
+
+Average = 0.7428

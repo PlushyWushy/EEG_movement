@@ -64,15 +64,15 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Unrecognised flags are forwarded to the selected script. "
                "Use --list to see the matrix, --dry-run to resolve without running.")
-    ap.add_argument("--arch", choices=["multiview", "singleview"], default="multiview",
+    ap.add_argument("--arch", choices=["multiview", "singleview"], default="singleview",
                     help="multiview: five per-region CNNs + fusion attention. "
                          "singleview: every channel through ONE encoder, which is the "
                          "ablation of the multi-view architecture (default: multiview)")
-    ap.add_argument("--model", choices=["ann", "cnntosnn", "spikformer"], default="ann",
+    ap.add_argument("--model", choices=["ann", "cnntosnn", "spikformer"], default="spikformer",
                     help="ann: no spikes. cnntosnn: post-hoc conversion of the CNNs, "
                          "ANN attention kept. spikformer: converted CNNs frozen and "
                          "spiking attention trained on top (default: ann)")
-    ap.add_argument("--task", choices=["full", "leftright", "task-only"], default="full",
+    ap.add_argument("--task", choices=["full", "leftright", "task-only"], default="task-only",
                     help="full: 5-class. leftright: left vs right imagined fist. "
                          "task-only: 4-class, baseline excluded from the answer choices. "
                          "Both narrowed tasks keep their excluded chunks as unlabelled "

@@ -8,6 +8,7 @@ No pretraining: Test accuracy=0.8272, Task-only accuracy (baseline chunks exclud
 50 epoch pretraining + better data augmentation + dropout in classfier + pretraining mask fraction = 0.15: Test accuracy=0.8554, Task-only accuracy (baseline chunks excluded): 0.7104
 """
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -345,8 +346,13 @@ class RunSequenceDataset(torch.utils.data.Dataset):
 
     def __init__(self, X, y, lengths, indices, neighbors=None, smote_prob=0.0,
                  lam_max=1.0, mirror_prob=0.0, channel_drop=0.0, scale_jitter=0.0,
-                 time_mask_frac=0.0, noise_std=0.0, seed=42):
+                 time_mask_frac=0.0, noise_std=0.0, seed=42, subject_idx=None):
         self.X, self.y, self.lengths, self.indices = X, y, lengths, indices
+        # Contiguous 0..n_subjects-1 index per sequence, not the raw subject
+        # number (which has gaps). Only supplied by the subject-conditioned
+        # path; when it is None every item is the usual 3-tuple and nothing
+        # downstream can tell this parameter exists.
+        self.subject_idx = subject_idx
         self.neighbors = neighbors
         self.smote_prob = smote_prob
         self.lam_max = lam_max
@@ -370,7 +376,7 @@ class RunSequenceDataset(torch.utils.data.Dataset):
         n_valid = int(self.lengths[j])
 
         if not self.augment:
-            return torch.from_numpy(x), torch.from_numpy(yv), n_valid
+            return self._emit(x, yv, n_valid, j)
 
         x, yv = x.copy(), yv.copy()
         rng = self.rng
@@ -420,7 +426,13 @@ class RunSequenceDataset(torch.utils.data.Dataset):
             x[:n_valid] += rng.normal(
                 0.0, self.noise_std, x[:n_valid].shape).astype(np.float32)
 
-        return torch.from_numpy(x), torch.from_numpy(yv), n_valid
+        return self._emit(x, yv, n_valid, j)
+
+    def _emit(self, x, yv, n_valid, j):
+        item = (torch.from_numpy(x), torch.from_numpy(yv), n_valid)
+        if self.subject_idx is None:
+            return item
+        return item + (int(self.subject_idx[j]),)
 
 
 # --------------------------------------------------------------------------
@@ -600,14 +612,39 @@ def load_model(path, device="cpu"):
     return model, ckpt["classes"]
 
 
+def build_scheduler(optimizer, schedule, epochs, warmup_epochs):
+    """LambdaLR: linear warmup then cosine decay to 0, stepped once per epoch
+    over the full --epochs/--snn-epochs budget regardless of when early
+    stopping actually fires. schedule="none" returns None so callers can skip
+    scheduler.step() and keep the flat LR every script used before this."""
+    if schedule == "none":
+        return None
+    warmup_epochs = max(0, min(warmup_epochs, epochs - 1))
+
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(epochs - warmup_epochs, 1)
+        return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def run_epoch(model, loader, criterion, optimizer, device, train):
     model.train(train)
     total_loss, correct, n = 0.0, 0, 0
-    for xb, yb, lb in loader:
-        xb, yb, lb = xb.to(device), yb.to(device), lb.to(device)
+    # A subject-conditioned dataset emits a 4th element and a model that can
+    # use it sets wants_subject. Both have to be true before the subject index
+    # is forwarded, so a model without the attribute gets the exact two-argument
+    # call it always got, whatever the loader happens to yield.
+    wants_subject = getattr(model, "wants_subject", False)
+    for batch in loader:
+        xb, yb, lb = batch[0].to(device), batch[1].to(device), batch[2].to(device)
+        sid = batch[3].to(device) if len(batch) > 3 else None
         pad_mask = make_pad_mask(lb, xb.shape[1], device)
         with torch.set_grad_enabled(train):
-            logits = model(xb, pad_mask)
+            logits = (model(xb, pad_mask, sid) if (wants_subject and sid is not None)
+                      else model(xb, pad_mask))
             loss = criterion(logits.reshape(-1, logits.shape[-1]), yb.reshape(-1))
             if train:
                 optimizer.zero_grad()

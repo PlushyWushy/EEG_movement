@@ -73,12 +73,13 @@ class SingleViewChunkEncoder(nn.Module):
     """
 
     def __init__(self, channel_idx, d_model, dropout=0.3, f1=8, depth=2,
-                 encoder_cls=ViewEncoder):
+                 intra_chunk_attn=False, intra_heads=4, encoder_cls=ViewEncoder):
         super().__init__()
         self.register_buffer("idx", torch.as_tensor(channel_idx), persistent=False)
         self.encoders = nn.ModuleDict({
             VIEW_KEY: encoder_cls(len(channel_idx), d_model, f1=f1, depth=depth,
-                                  dropout=dropout)})
+                                  dropout=dropout, intra_chunk_attn=intra_chunk_attn,
+                                  intra_heads=intra_heads)})
 
     def forward(self, x):                 # (N, 64, 640) -> (N, d_model)
         return self.encoders[VIEW_KEY](x.index_select(1, self.idx))
@@ -148,8 +149,8 @@ def pretrain_single(model, loader, device, epochs, mask_frac, lr, d_model, idx):
     for ep in range(1, epochs + 1):
         model.train()
         total, n = 0.0, 0
-        for xb, yb, lb in loader:
-            xb, lb = xb.to(device), lb.to(device)
+        for batch in loader:
+            xb, lb = batch[0].to(device), batch[2].to(device)
             B, T = xb.shape[:2]
             pad_mask = make_pad_mask(lb, T, device)
             maskable = (~pad_mask).clone()

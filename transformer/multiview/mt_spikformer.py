@@ -436,9 +436,22 @@ class ViewEncoder(nn.Module):
     into named submodules so SpikingViewEncoder can address each conv,
     BatchNorm and activation, and the two ELUs are ReLUs so their output
     maps onto a firing rate. Everything else -- layer order, kernel sizes,
-    groups, bias=False, pooling, dropout -- is unchanged."""
+    groups, bias=False, pooling, dropout -- is unchanged.
 
-    def __init__(self, n_channels, d_model, f1=8, depth=2, dropout=0.4):
+    intra_chunk_attn=True (off by default, so multiview is untouched) adds
+    an ANN-side counterpart to sv_spikformer.py's --intra-chunk-attn: a
+    trainable attention pass over the 20 pooled time bins, gated on top of
+    the usual flatten-and-project token exactly like context_gate gates
+    context on top of local at the run level. It exists so that flag has
+    something phase 1 actually validated to warm-start from, rather than
+    asking phase 2's surrogate-gradient training to learn the mechanism
+    from nothing -- intra_proj/intra_pos/intra_gate carry over directly
+    (see SingleSpikformerRunModel), the attention layer itself doesn't
+    (nn.TransformerEncoderLayer has no spiking equivalent, same reason
+    self.context's SpikformerBlocks aren't warm-started either)."""
+
+    def __init__(self, n_channels, d_model, f1=8, depth=2, dropout=0.4,
+                 intra_chunk_attn=False, intra_heads=4):
         super().__init__()
         f2 = f1 * depth
         # ~0.4 s temporal kernel at 160 Hz -- spans mu/beta cycles
@@ -458,12 +471,29 @@ class ViewEncoder(nn.Module):
         self.drop2 = nn.Dropout(dropout)
         self.proj = nn.Linear(f2 * (N_SAMPLES // 32), d_model)
 
+        self.intra_chunk_attn = intra_chunk_attn
+        if intra_chunk_attn:
+            n_bins = N_SAMPLES // 32
+            self.intra_proj = nn.Linear(f2, d_model)
+            self.intra_pos = nn.Parameter(torch.zeros(n_bins, d_model))
+            nn.init.normal_(self.intra_pos, std=0.02)
+            self.intra_attn = nn.TransformerEncoderLayer(
+                d_model, intra_heads, dim_feedforward=2 * d_model,
+                dropout=dropout, batch_first=True, norm_first=True)
+            self.intra_gate = nn.Parameter(torch.tensor(0.1))
+
     def forward(self, x):                         # x: (N, C_view, 640)
         h = self.bn2(self.spatial(self.bn1(self.temporal(x.unsqueeze(1)))))
         h = self.drop1(self.pool1(self.act1(h)))
         h = self.bn3(self.sep_point(self.sep_depth(h)))
         h = self.drop2(self.pool2(self.act2(h)))  # (N, f2, 1, 20)
-        return self.proj(h.flatten(1))
+        proj_out = self.proj(h.flatten(1))
+        if not self.intra_chunk_attn:
+            return proj_out
+        bins = h.squeeze(2).transpose(1, 2)              # (N, 20, f2)
+        tok = self.intra_proj(bins) + self.intra_pos.unsqueeze(0)
+        attn_out = self.intra_attn(tok).mean(dim=1)       # (N, d_model)
+        return proj_out + self.intra_gate * attn_out
 
 
 class MultiViewChunkEncoder(nn.Module):
@@ -744,10 +774,10 @@ def calibrate_thresholds(model, loader, device, n_batches, percentile):
     handles = [getattr(enc, act).register_forward_hook(make_hook(key, act))
                for key, enc in chunk_enc.encoders.items() for act in ACT_LAYERS]
     try:
-        for i, (xb, _, lb) in enumerate(loader):
+        for i, batch in enumerate(loader):
             if i >= n_batches:
                 break
-            xb = xb.to(device)
+            xb, lb = batch[0].to(device), batch[2]
             valid = ~make_pad_mask(lb, xb.shape[1], device)
             chunk_enc(xb[valid])
     finally:
@@ -808,27 +838,61 @@ class SpikingViewEncoder:
         return spk, mem - spk * threshold
 
     @torch.no_grad()
-    def start(self, x):
+    def start(self, x, dynamic=None):
         """Membrane state for one view's chunks. The temporal->spatial run is
         linear and the analog input is constant, so its output current is
-        computed once here rather than at every timestep."""
+        computed once here rather than at every timestep.
+
+        `dynamic` is the exception: an object with .step() returning this
+        timestep's input, used when something upstream is itself spiking (see
+        sv_spikformer.py's --subject-front). The caching above depends on the
+        input being constant, so a dynamic source gives that up and `pre` is
+        recomputed every timestep instead."""
+        if dynamic is not None:
+            return {"cur1": None, "mem1": None, "mem2": None, "dynamic": dynamic}
         cur1 = self.pre(x.unsqueeze(1))
-        return {"cur1": cur1, "mem1": torch.zeros_like(cur1), "mem2": None}
+        return {"cur1": cur1, "mem1": torch.zeros_like(cur1), "mem2": None,
+                "dynamic": None}
+
+    @torch.no_grad()
+    def _advance(self, state):
+        """Shared IF-neuron dynamics for one timestep, stopping at the
+        pooled post-pool2 spikes -- step() and step_both() both build on
+        this so neither can drift out of sync with the other, and so a
+        caller needing both outputs never advances the LIF state twice.
+
+        Stepwise rather than a self-contained loop because the spiking
+        transformer above has to be advanced in lockstep with this."""
+        if state.get("dynamic") is not None:
+            cur1 = self.pre(state["dynamic"].step().unsqueeze(1))
+            if state["mem1"] is None:
+                state["mem1"] = torch.zeros_like(cur1)
+        else:
+            cur1 = state["cur1"]
+        spk1, state["mem1"] = self._if_step(cur1, state["mem1"], self.thr1)
+        cur2 = self.mid(self.pool1(spk1 * self.thr1))
+        if state["mem2"] is None:
+            state["mem2"] = torch.zeros_like(cur2)
+        spk2, state["mem2"] = self._if_step(cur2, state["mem2"], self.thr2)
+        return self.pool2(spk2 * self.thr2), spk1, spk2
 
     @torch.no_grad()
     def step(self, state):
         """Advance one timestep. Returns the projection's input current --
         the raw ANN-scale token, before any rate decoding or token
-        normalisation -- and both layers' spike tensors.
+        normalisation -- and both layers' spike tensors."""
+        pooled, spk1, spk2 = self._advance(state)
+        return self.proj(pooled.flatten(1)), spk1, spk2
 
-        Stepwise rather than a self-contained loop because the spiking
-        transformer above has to be advanced in lockstep with this."""
-        spk1, state["mem1"] = self._if_step(state["cur1"], state["mem1"], self.thr1)
-        cur2 = self.mid(self.pool1(spk1 * self.thr1))
-        if state["mem2"] is None:
-            state["mem2"] = torch.zeros_like(cur2)
-        spk2, state["mem2"] = self._if_step(cur2, state["mem2"], self.thr2)
-        return self.proj(self.pool2(spk2 * self.thr2).flatten(1)), spk1, spk2
+    @torch.no_grad()
+    def step_both(self, state):
+        """Like step(), but also returns the pooled per-bin spikes (N, f2,
+        1, n_bins) from before the frozen projection, in the same call so
+        the LIF state only advances once. See sv_spikformer.py's
+        --intra-chunk-attn, which gates a trainable attention-over-bins
+        token against this method's frozen projection token."""
+        pooled, spk1, spk2 = self._advance(state)
+        return self.proj(pooled.flatten(1)), pooled, spk1, spk2
 
     @torch.no_grad()
     def run(self, x, timesteps, checkpoints):
@@ -944,9 +1008,10 @@ def evaluate_hybrid(hybrid, loader, device, timesteps, checkpoints,
     ann_preds, trues = [], []
     rate_sums, n_batches = {}, 0
 
-    for i, (xb, yb, lb) in enumerate(loader):
+    for i, batch in enumerate(loader):
         if limit_batches and i >= limit_batches:
             break
+        xb, yb, lb = batch[0], batch[1], batch[2]
         xb, lb = xb.to(device), lb.to(device)
         pad_mask = make_pad_mask(lb, xb.shape[1], device)
         t0 = time.time()
@@ -1047,10 +1112,10 @@ def calibrate_token_scales(model, loader, device, n_batches, percentile):
     handles = [enc.proj.register_forward_hook(make_hook(key))
                for key, enc in chunk_enc.encoders.items()]
     try:
-        for i, (xb, _, lb) in enumerate(loader):
+        for i, batch in enumerate(loader):
             if i >= n_batches:
                 break
-            xb = xb.to(device)
+            xb, lb = batch[0].to(device), batch[2]
             chunk_enc(xb[~make_pad_mask(lb, xb.shape[1], device)])
     finally:
         for h in handles:
@@ -1371,7 +1436,8 @@ def calibrate_ssa_scales(spiking, loader, device, target=1.0):
 
     was_training = spiking.training
     spiking.eval()
-    xb, _, lb = next(iter(loader))
+    batch = next(iter(loader))
+    xb, lb = batch[0], batch[2]
     xb, lb = xb.to(device), lb.to(device)
     spiking(xb, make_pad_mask(lb, xb.shape[1], device))
     spiking.train(was_training)

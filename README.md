@@ -10,43 +10,36 @@ python predict.py path/to/edf
 
 If there are any troubles with the running, email me at alex_zhang2@berkeley.edu.
 
-Writeup:
 
-Explain your data processing pipeline. 
+
+Data Preprocessing: 
 
 I initially followed the CNN-GRU process quite closely. 
 That process cleans the raw recordings (standard montage, notch filter, ICA for eye/muscle artifacts), narrows each one down to a handful of sensorimotor channel pairs, band-passes to the motor-relevant frequency range, and cuts the signal into per-trial windows, normalizing each subject against their own signal so amplitude differences between people don't leak in. SMOTE then rebalances the training set toward the rarer classes. However, I must've done something wrong with this preprocessing, as it seems that the networks I used with it performed similarly/worse. So, I moved away from it in favor of feeding the networks more raw signals, as each of the transformer tests were run without preprocessing with all 64 channels, though SMOTE and other augmentations were still used at training time.
 
-What your model can and cannot do. 
+Scope:
 
 The situation the main reported accuracies describe are for imagined LH vs RH, meaning, if deployed in its current state, it would be able to differentiate whether the user had imagined squeezing their left hand vs their right hand. One condition for this model is the four second interval. Since it was trained using the specific 4 second intervals provided by this dataset, it may have more trouble with shorter imagined squeeze times. For the range of accuracies, see accuracy_tracker.txt.
 
-That the result is not an artifact of how you measured it. 
 
 I tailored the main experiment (imagined RH vs LH) to be directly comparable to Kumar, Tang, Yoo & Michmizos 2022, as they were the highest accuracy for that task I could find. For these tests, the train-val and test sets were split. For training and validation, 90 subjects were chosen. Thus, if any overfitting happened on these 90 subjects, the test accuracy would show. This is also how Kumar et al. performed their tests. This is also where the model got the 89.21% average accuracy. 
 
 For the full dataset task, I used the default individual splitting method, where each individual subject's data is split into train-val-test. Here, I originally allowed the model to guess "baseline" along with the other four classes, just like CNN-GRU did. However, this inflated the accuracy and was uncomparable to the papers I found in litreview, so I excluded that choice for the reported "full task" runs.  
 
-What the appropriate baselines are + performance attribution.
+Baselines: 
 
 Because of the way the data was taken, a given 4 second interval is affected by the previous 4 second intervals due to participant memory. So, with the attention mechanism, what I'm really decoding is what the current 4 second interval is given all the previous 4 second intervals. That is the core insight of this project. 
 
 For other baselines, I used what I found in my literature review, along with my CNN-GRU and EEGnet implementations. 
 
-
-
-How much of this is about the person rather than the task. These recordings come from many individuals, and individuals differ from each other in ways that have nothing to do with what they were imagining. Quantify how much this matters for your result.
-
 When testing under the 90:13 split regime, the val accuracy during training did not deviate too much from the final test accuracy. This is evidence that, at least for those three seeds, the model generalized well on the chosen test participants based on the 90 train participants, meaning the individual may not matter too much for this model when it comes to imagined RH vs LH. 
-
-Whether your model has learned or memorized. Where does it overfit, to what, and how do you know?
 
 Since I used SMOTE and randaugment, it only tended to overfit slightly at the end. Specifically, the train accuracy tends to begin leaving the val accuracy behind at about 89% accuracy. Before that, however, there usually isn't any overfitting. This could be attributed to the augmentation mechanism running out of ways to help on specific trials and its exhaustion. Furthermore, the val set is never augmented, so perhaps at some point, the model starts getting extra points on the augmented trials that the val set doesn't give. 
 
 
 
 
-Your evaluation and what it establishes. 
+Evaluation:
 
 The final results were the evaluations of CNN-GRU, EEGnet, and the singleview transformer to SNN pipeline. I also provide an ablation for the attention mechanism that attends each four second interval to each one before it, showing that this mechanism yields a meaningful boost in accuracy. 
 
@@ -64,25 +57,20 @@ The accuracies of each test can be found in accuracy_tracker.txt. As that .txt f
 
 The four class tests are currently running, though I expect it to beat at least Li and Fan's 67.24%. This evaluation establishes a novel method of using spiking networks to analyze these signals, paving way for ultra low power onboard EEG analysis. 
 
-
-One design decision. 
-
 The most important decision made during this project was based on the insight that past 4-second intervals may affect future 4-second intervals, inspiring the interval level attention mechanism. As shown by the ablation, this alone boosted the accuracy by 3.94%. 
 
 
 
-Your weakest point. 
+Limitations:
 
 The purpose of creating an SNN to analyze EEG is to take advantage of its high efficiency on neuromorphic hardware. However, I unfortunately do not have access to any actual neuromorphic chips. The weakest point of this project, I believe, is the lack of testing on true neuromorphic hardware. Furthermore, I believe not many chips currently are able to support the spiking attention, so compatibility may also be a large issue. 
 
-
-Something we did not ask about.
+Other interesting stuff:
 
 Of course, as the ablation showed, the key insight of this project was the intervals affecting each other down the line. Beyond this, I found that preprocessing this data tended not to help as much as I expected. I originally followed the CNN-GRU's preprocessing pipeline, with their band filtering and ICA. However, I tried it without, and the networks I tested performed better. Perhaps the preprocessing was implemented incorrectly. Nonetheless, I proceeded without. 
 
 
-
-What you would do next with more time and more compute.
+Future work:
 
 1. 5 seeded runs instead of 3. Spiking neural network performance can be very random.
 
